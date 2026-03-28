@@ -43,7 +43,7 @@ def setup_logging(verbose: bool = False) -> None:
 @click.option("--silence-threshold", type=float, default=-35, help="Silence threshold in dB.")
 @click.option("--detailed", is_flag=True, help="Output full JSON manifest.")
 @click.option("--whisper-model", default="whisper-1", help="Whisper model to use for transcription.")
-@click.option("--llm-model", default="gpt-4o", help="LLM model for chunk analysis.")
+@click.option("--llm-model", default="deepseek-chat", help="LLM model for chunk analysis. Use 'deepseek-chat' or 'deepseek-reasoner' for DeepSeek, or 'gpt-4o' for OpenAI.")
 @click.option("--dry-run", is_flag=True, help="Show detected chunks without splitting.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose/debug logging.")
 @click.version_option(version=__version__)
@@ -77,8 +77,18 @@ def cli(
         script_text = script.read_text(encoding="utf-8")
         console.print(f"[dim]Loaded script from {script}[/dim]")
 
-    # Initialize OpenAI client
-    client = OpenAI()
+    # Initialize clients — transcription always uses OpenAI (Whisper),
+    # LLM analysis client routes to DeepSeek or OpenAI based on model name.
+    import os
+    whisper_client = OpenAI()
+    if llm_model.startswith("deepseek"):
+        llm_client = OpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com",
+        )
+    else:
+        llm_client = OpenAI()
+    client = whisper_client  # kept for compatibility
 
     with Progress(
         SpinnerColumn(),
@@ -123,7 +133,7 @@ def cli(
             transcript = transcribe_audio(
                 input_video,
                 model=whisper_model,
-                client=client,
+                client=whisper_client,
             )
         except Exception as e:
             console.print(f"[red]Transcription error:[/red] {e}")
@@ -165,7 +175,7 @@ def cli(
                 video_type=video_type,
                 script=script_text,
                 model=llm_model,
-                client=client,
+                client=llm_client,
             )
         except Exception as e:
             console.print(f"[red]Analysis error:[/red] {e}")
