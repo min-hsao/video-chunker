@@ -9,7 +9,11 @@ from dataclasses import asdict
 from pathlib import Path
 
 import click
+from dotenv import load_dotenv
 from openai import OpenAI
+
+# Load .env from current dir or any parent — silent if not found
+load_dotenv()
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
