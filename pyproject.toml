@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-chunker"
+version = "0.1.0"
+description = "CLI tool to split long video recordings into labeled chunks using silence detection and AI analysis"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1.0",
+    "openai>=1.0.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+video-chunker = "video_chunker.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["video_chunker*"]
