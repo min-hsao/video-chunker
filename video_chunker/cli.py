@@ -90,6 +90,13 @@ def cli(
             api_key=os.environ.get("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com",
         )
+    elif llm_model.startswith("local/"):
+        # Local LM Studio — strip "local/" prefix to get the actual model id
+        llm_model = llm_model[len("local/"):]
+        llm_client = OpenAI(
+            api_key="lm-studio",
+            base_url=os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"),
+        )
     else:
         llm_client = OpenAI()
     client = whisper_client  # kept for compatibility
