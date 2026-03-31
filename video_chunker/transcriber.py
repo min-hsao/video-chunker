@@ -84,9 +84,18 @@ def _transcribe_local(
             "openai-whisper is not installed. Run: pip install openai-whisper"
         )
 
-    logger.info("Transcribing with local Whisper model '%s'", model)
+    # Pick the best available device: CUDA > MPS (Apple Silicon) > CPU
+    import torch
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
 
-    whisper_model = whisper.load_model(model)
+    logger.info("Transcribing with local Whisper model '%s' on %s", model, device)
+
+    whisper_model = whisper.load_model(model, device=device)
 
     kwargs: dict = {"word_timestamps": True}
     if language:
