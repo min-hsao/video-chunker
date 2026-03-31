@@ -48,7 +48,23 @@ if [[ ! -f "$MARKER" ]]; then
   echo "Setting up virtual environment at $VENV_DIR ..."
   # Remove stale venv if it exists
   [[ -d "$VENV_DIR" ]] && rm -rf "$VENV_DIR"
-  python3 -m venv "$VENV_DIR"
+  # Prefer Homebrew Python 3.12+ over system Python (macOS ships 3.9)
+  PYTHON3=""
+  for candidate in python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" &>/dev/null; then
+      version=$("$candidate" -c "import sys; print(sys.version_info >= (3,10))")
+      if [[ "$version" == "True" ]]; then
+        PYTHON3="$candidate"
+        break
+      fi
+    fi
+  done
+  if [[ -z "$PYTHON3" ]]; then
+    echo "Error: Python 3.10+ is required. Install it via: brew install python@3.12"
+    exit 1
+  fi
+  echo "Using $PYTHON3 ($(${PYTHON3} --version))"
+  "$PYTHON3" -m venv "$VENV_DIR"
   echo "Installing video-chunker (this may take a minute on first run)..."
   "$VENV_DIR/bin/pip" install --quiet --upgrade pip
   "$VENV_DIR/bin/pip" install --quiet -e "$SCRIPT_DIR"
