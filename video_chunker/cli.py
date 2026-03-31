@@ -46,7 +46,8 @@ def setup_logging(verbose: bool = False) -> None:
 @click.option("--silence-duration", type=float, default=2.0, help="Minimum silence duration in seconds to consider as a break.")
 @click.option("--silence-threshold", type=float, default=-35, help="Silence threshold in dB.")
 @click.option("--detailed", is_flag=True, help="Output full JSON manifest.")
-@click.option("--whisper-model", default="whisper-1", help="Whisper model to use for transcription.")
+@click.option("--whisper-mode", default="local", type=click.Choice(["local", "openai"], case_sensitive=False), help="Whisper mode: local (free, runs on your machine) or openai (paid API).")
+@click.option("--whisper-model", default="base", help="Whisper model to use for transcription. For local: tiny, base, small, medium, large-v3. For openai: whisper-1, whisper-large-v3, etc.")
 @click.option("--llm-model", default="deepseek-chat", help="LLM model for chunk analysis. Use 'deepseek-chat' or 'deepseek-reasoner' for DeepSeek, or 'gpt-4o' for OpenAI.")
 @click.option("--dry-run", is_flag=True, help="Show detected chunks without splitting.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose/debug logging.")
@@ -60,6 +61,7 @@ def cli(
     silence_duration: float,
     silence_threshold: float,
     detailed: bool,
+    whisper_mode: str,
     whisper_model: str,
     llm_model: str,
     dry_run: bool,
@@ -81,10 +83,14 @@ def cli(
         script_text = script.read_text(encoding="utf-8")
         console.print(f"[dim]Loaded script from {script}[/dim]")
 
-    # Initialize clients — transcription always uses OpenAI (Whisper),
+    # Initialize clients — transcription uses local Whisper by default,
+    # with OpenAI API as optional fallback via --whisper-mode openai.
     # LLM analysis client routes to DeepSeek or OpenAI based on model name.
     import os
-    whisper_client = OpenAI()
+    if whisper_mode == "openai":
+        whisper_client = OpenAI()
+    else:
+        whisper_client = None  # Not used for local mode
     if llm_model.startswith("deepseek"):
         llm_client = OpenAI(
             api_key=os.environ.get("DEEPSEEK_API_KEY"),
@@ -144,6 +150,7 @@ def cli(
             transcript = transcribe_audio(
                 input_video,
                 model=whisper_model,
+                mode=whisper_mode,
                 client=whisper_client,
             )
         except Exception as e:

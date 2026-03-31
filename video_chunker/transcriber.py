@@ -1,4 +1,4 @@
-"""Audio transcription using OpenAI Whisper API."""
+"""Audio transcription using local Whisper or OpenAI Whisper API."""
 
 from __future__ import annotations
 
@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 
 # Whisper API file size limit (25 MB)
 MAX_FILE_SIZE = 25 * 1024 * 1024
+
+# Local Whisper model sizes
+WHISPER_MODELS = {
+    "tiny": 39e6,  # 39M params
+    "base": 74e6,  # 74M params
+    "small": 244e6,  # 244M params
+    "medium": 769e6,  # 769M params
+    "large-v3": 1550e6,  # 1.5B params
+}
 
 
 @dataclass
@@ -40,44 +49,97 @@ class Transcript:
 def transcribe_audio(
     video_path: Path,
     *,
-    model: str = "whisper-1",
+    model: str = "base",
+    mode: str = "local",
     client: OpenAI | None = None,
 ) -> Transcript:
-    """Transcribe audio from a video file using OpenAI Whisper API.
+    """Transcribe audio from a video file.
 
-    Extracts audio, splits into chunks if needed (25MB limit), and returns
-    a full transcript with timestamps.
+    Args:
+        video_path: Path to the video file
+        model: Whisper model name (e.g., "base", "small", "whisper-1" for API)
+        mode: "local" or "openai"
+        client: OpenAI client (required for openai mode)
+
+    Extracts audio and returns a full transcript with timestamps.
     """
-    if client is None:
-        client = OpenAI()
-
     # Extract audio to a temporary WAV file
     logger.info("Extracting audio from %s", video_path.name)
     audio_path = extract_audio(video_path)
 
     try:
-        file_size = audio_path.stat().st_size
-
-        if file_size <= MAX_FILE_SIZE:
-            return _transcribe_file(audio_path, model=model, client=client)
-
-        # For large files, split into chunks
-        logger.info("Audio file is %.1f MB, splitting into chunks", file_size / 1024 / 1024)
-        return _transcribe_large_file(audio_path, model=model, client=client)
+        if mode == "local":
+            return _transcribe_local(audio_path, model=model)
+        else:  # mode == "openai"
+            if client is None:
+                client = OpenAI()
+            return _transcribe_openai(audio_path, model=model, client=client)
     finally:
         # Clean up temp file
         audio_path.unlink(missing_ok=True)
 
 
-def _transcribe_file(
+def _transcribe_local(
+    audio_path: Path,
+    *,
+    model: str = "base",
+) -> Transcript:
+    """Transcribe using local Whisper library."""
+    import whisper
+
+    logger.info("Transcribing %s with local Whisper model %s", audio_path.name, model)
+
+    # Load the model (cached locally)
+    whisper_model = whisper.load_model(model)
+
+    # Transcribe with word-level timestamps
+    result = whisper_model.transcribe(
+        str(audio_path),
+        language="en",
+        word_timestamps=True,
+    )
+
+    # Convert to our format
+    segments = []
+    for seg in result.get("segments", []):
+        segments.append(TranscriptSegment(
+            text=seg.get("text", "").strip(),
+            start=seg.get("start", 0.0),
+            end=seg.get("end", 0.0),
+        ))
+
+    return Transcript(
+        text=result.get("text", "").strip(),
+        segments=segments,
+    )
+
+
+def _transcribe_openai(
     audio_path: Path,
     *,
     model: str,
     client: OpenAI,
 ) -> Transcript:
-    """Transcribe a single audio file."""
-    logger.info("Transcribing %s with model %s", audio_path.name, model)
+    """Transcribe using OpenAI Whisper API."""
+    logger.info("Transcribing %s with OpenAI Whisper API model %s", audio_path.name, model)
 
+    file_size = audio_path.stat().st_size
+
+    if file_size <= MAX_FILE_SIZE:
+        return _transcribe_openai_file(audio_path, model=model, client=client)
+
+    # For large files, split into chunks
+    logger.info("Audio file is %.1f MB, splitting into chunks", file_size / 1024 / 1024)
+    return _transcribe_openai_large_file(audio_path, model=model, client=client)
+
+
+def _transcribe_openai_file(
+    audio_path: Path,
+    *,
+    model: str,
+    client: OpenAI,
+) -> Transcript:
+    """Transcribe a single audio file via API."""
     with open(audio_path, "rb") as f:
         response = client.audio.transcriptions.create(
             model=model,
@@ -100,7 +162,7 @@ def _transcribe_file(
     )
 
 
-def _transcribe_large_file(
+def _transcribe_openai_large_file(
     audio_path: Path,
     *,
     model: str,
@@ -132,7 +194,7 @@ def _transcribe_large_file(
                 capture_output=True, text=True, check=True,
             )
 
-            transcript = _transcribe_file(chunk_path, model=model, client=client)
+            transcript = _transcribe_openai_file(chunk_path, model=model, client=client)
 
             # Adjust timestamps by offset
             for seg in transcript.segments:

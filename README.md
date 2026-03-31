@@ -18,7 +18,9 @@ Designed for creators who record multiple takes in a single session — product 
 
 - Python 3.10+
 - [ffmpeg](https://ffmpeg.org/) and ffprobe installed and on your PATH
-- An [OpenAI API key](https://platform.openai.com/api-keys) set as `OPENAI_API_KEY`
+- For local Whisper mode: None required (runs on your machine)
+- For OpenAI Whisper mode: An [OpenAI API key](https://platform.openai.com/api-keys) set as `OPENAI_API_KEY`
+- For LLM analysis (optional): `DEEPSEEK_API_KEY` for DeepSeek models, or `OPENAI_API_KEY` for GPT-4o
 
 ## Installation
 
@@ -82,11 +84,28 @@ Shows detected chunks and analysis in a table without writing any files.
 
 ### Choose models
 
+**Local Whisper (default, free):**
+
 ```bash
-video-chunker recording.mp4 \
-  --whisper-model whisper-1 \
-  --llm-model gpt-4o
+video-chunker recording.mp4 --whisper-model base
 ```
+
+Available models: `tiny` (fastest, less accurate), `base` (default, good balance), `small`, `medium`, `large-v3` (most accurate, slower).
+
+**OpenAI Whisper API (paid, faster for long videos):**
+
+```bash
+export OPENAI_API_KEY=your_key_here
+video-chunker recording.mp4 --whisper-mode openai --whisper-model whisper-1
+```
+
+**LLM analysis:**
+
+```bash
+video-chunker recording.mp4 --llm-model deepseek-chat
+```
+
+Set `DEEPSEEK_API_KEY` for DeepSeek models, or `OPENAI_API_KEY` for GPT-4o.
 
 ## CLI Reference
 
@@ -103,8 +122,9 @@ Options:
   --silence-duration FLOAT    Minimum silence duration in seconds (default: 2.0)
   --silence-threshold FLOAT   Silence threshold in dB (default: -35)
   --detailed                  Output full JSON manifest
-  --whisper-model TEXT        Whisper model to use (default: whisper-1)
-  --llm-model TEXT            LLM model for analysis (default: gpt-4o)
+  --whisper-mode [local|openai] Whisper mode: local (free, runs on your machine) or openai (paid API) (default: local)
+  --whisper-model TEXT        Whisper model: tiny/base/small/medium/large-v3 (local) or whisper-1/whisper-large-v3 (openai) (default: base)
+  --llm-model TEXT            LLM model for analysis (default: deepseek-chat)
   --dry-run                   Show detected chunks without splitting
   -v, --verbose               Enable debug logging
   --version                   Show version
@@ -163,10 +183,10 @@ When `--detailed` is passed, a full manifest is printed with per-chunk data:
 
 1. **Probe** — `ffprobe` reads codec, resolution, duration, and fps
 2. **Silence detection** — `ffmpeg silencedetect` finds gaps exceeding the threshold
-3. **Transcription** — full audio is sent to OpenAI Whisper API (chunked if >25 MB)
+3. **Transcription** — audio is transcribed using local Whisper (default) or OpenAI Whisper API
 4. **Split point refinement** — silence midpoints are adjusted to nearest sentence boundaries; verbal cue keywords force additional splits
 5. **Keyframe snapping** — split points are snapped to the nearest video keyframe for clean cuts
-6. **LLM analysis** — each chunk's transcript is sent to GPT-4o to determine completeness and generate a brief description
+6. **LLM analysis** — each chunk's transcript is sent to DeepSeek or OpenAI to determine completeness and generate a brief description
 7. **Lossless split** — `ffmpeg -c copy` extracts each chunk without re-encoding
 8. **Naming** — files are named `{index}_{description}_{status}.{ext}`
 
