@@ -1,4 +1,4 @@
-"""LLM-based chunk analysis using OpenAI Chat API."""
+"""LLM-based chunk analysis using OpenAI-compatible Chat API."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def analyze_chunk(
     *,
     video_type: str = "product-demo",
     script: str | None = None,
-    model: str = "gpt-4o",
+    model: str = "deepseek-chat",
     client: OpenAI | None = None,
 ) -> ChunkAnalysis:
     """Analyze a chunk transcript using an LLM to determine completeness and description."""
@@ -52,10 +52,10 @@ For each chunk, determine:
 3. Your confidence level (0.0-1.0)
 4. Any notes about the content
 
-Respond in JSON format:
+Respond in JSON format only:
 {{
     "description": "brief description here",
-    "is_complete": true/false,
+    "is_complete": true,
     "confidence": 0.95,
     "notes": "optional notes"
 }}"""
@@ -76,32 +76,35 @@ Also assess how well this chunk matches the script and include a "script_match" 
 {chunk.transcript or "(no speech detected)"}
 ---"""
 
-    logger.info("Analyzing chunk %d with %s", chunk.index + 1, model)
+    logger.info("Analyzing chunk %d with model %s", chunk.index + 1, model)
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.3,
-    )
-
-    content = response.choices[0].message.content or "{}"
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+        content = response.choices[0].message.content or "{}"
+    except Exception as e:
+        logger.warning("LLM analysis failed for chunk %d: %s", chunk.index + 1, e)
+        content = "{}"
 
     try:
         data = json.loads(content)
     except json.JSONDecodeError:
-        logger.warning("Failed to parse LLM response as JSON, using defaults")
+        logger.warning("Failed to parse LLM response as JSON for chunk %d", chunk.index + 1)
         data = {}
 
     return ChunkAnalysis(
         description=data.get("description", "untitled_segment"),
-        is_complete=data.get("is_complete", False),
-        confidence=data.get("confidence", 0.5),
-        notes=data.get("notes", ""),
-        script_match=data.get("script_match", ""),
+        is_complete=bool(data.get("is_complete", False)),
+        confidence=float(data.get("confidence", 0.5)),
+        notes=str(data.get("notes", "")),
+        script_match=str(data.get("script_match", "")),
     )
 
 
@@ -110,7 +113,7 @@ def analyze_chunks(
     *,
     video_type: str = "product-demo",
     script: str | None = None,
-    model: str = "gpt-4o",
+    model: str = "deepseek-chat",
     client: OpenAI | None = None,
 ) -> list[ChunkInfo]:
     """Analyze all chunks and attach analysis results."""

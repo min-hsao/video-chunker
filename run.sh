@@ -7,6 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 ENV_FILE="$SCRIPT_DIR/.env"
+MARKER="$VENV_DIR/.install_ok"
 
 # ── 1. First-run: prompt for API keys ────────────────────────────────────────
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -15,19 +16,21 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "│  video-chunker — first-run setup             │"
   echo "└─────────────────────────────────────────────┘"
   echo ""
-  echo "Enter your API keys (input is hidden):"
+  echo "Transcription uses local Whisper by default (free, no API key needed)."
+  echo "DeepSeek is used for chunk analysis (recommended, cheap)."
+  echo "OpenAI key is only needed if you want to use --whisper-mode openai."
   echo ""
 
-  read -rsp "  OpenAI API key  (for Whisper transcription): " OPENAI_KEY
+  read -rsp "  DeepSeek API key (for chunk analysis, required): " DEEPSEEK_KEY
   echo ""
-  read -rsp "  DeepSeek API key (for chunk analysis)       : " DEEPSEEK_KEY
+  read -rsp "  OpenAI API key   (optional, only for --whisper-mode openai): " OPENAI_KEY
   echo ""
   echo ""
 
   cat > "$ENV_FILE" <<EOF
 # video-chunker environment variables
-OPENAI_API_KEY=${OPENAI_KEY}
 DEEPSEEK_API_KEY=${DEEPSEEK_KEY}
+OPENAI_API_KEY=${OPENAI_KEY}
 EOF
 
   echo "✓ .env saved to $ENV_FILE"
@@ -40,14 +43,17 @@ set -o allexport
 source "$ENV_FILE"
 set +o allexport
 
-# ── 3. Create venv if it doesn't exist ───────────────────────────────────────
-if [[ ! -d "$VENV_DIR" ]]; then
-  echo "Creating virtual environment at $VENV_DIR ..."
+# ── 3. Create venv and install if not already done ───────────────────────────
+if [[ ! -f "$MARKER" ]]; then
+  echo "Setting up virtual environment at $VENV_DIR ..."
+  # Remove stale venv if it exists
+  [[ -d "$VENV_DIR" ]] && rm -rf "$VENV_DIR"
   python3 -m venv "$VENV_DIR"
-  echo "Installing video-chunker ..."
+  echo "Installing video-chunker (this may take a minute on first run)..."
   "$VENV_DIR/bin/pip" install --quiet --upgrade pip
   "$VENV_DIR/bin/pip" install --quiet -e "$SCRIPT_DIR"
-  echo "✓ venv ready"
+  touch "$MARKER"
+  echo "✓ Ready"
   echo ""
 fi
 
