@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
 import click
@@ -27,6 +27,8 @@ from .utils import detect_silence, get_keyframes, get_video_info
 
 console = Console()
 
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
+
 
 def setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -37,8 +39,28 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
+def make_clients(whisper_mode: str, llm_model: str):
+    """Create and return (whisper_client, llm_client)."""
+    whisper_client = OpenAI() if whisper_mode == "openai" else None
+
+    if llm_model.startswith("deepseek"):
+        llm_client = OpenAI(
+            api_key=os.environ.get("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com",
+        )
+    elif llm_model.startswith("local/"):
+        llm_client = OpenAI(
+            api_key="lm-studio",
+            base_url=os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"),
+        )
+    else:
+        llm_client = OpenAI()
+
+    return whisper_client, llm_client
+
+
 @click.command()
-@click.argument("input_video", type=click.Path(exists=True, path_type=Path))
+@click.argument("input_path", type=click.Path(exists=True, path_type=Path))
 @click.option("-o", "--output", "output_dir", type=click.Path(path_type=Path), default="./chunks", help="Output directory for chunks.")
 @click.option("--type", "video_type", default="product-demo", help="Video type: product-demo, tutorial, talking-head, or custom string.")
 @click.option("--script", type=click.Path(exists=True, path_type=Path), default=None, help="Path to draft script file for comparison.")
@@ -47,13 +69,13 @@ def setup_logging(verbose: bool = False) -> None:
 @click.option("--silence-threshold", type=float, default=-35, help="Silence threshold in dB.")
 @click.option("--detailed", is_flag=True, help="Output full JSON manifest.")
 @click.option("--whisper-mode", default="local", type=click.Choice(["local", "openai"], case_sensitive=False), help="Whisper mode: local (free, runs on your machine) or openai (paid API).")
-@click.option("--whisper-model", default="base", help="Whisper model to use for transcription. For local: tiny, base, small, medium, large-v3. For openai: whisper-1, whisper-large-v3, etc.")
-@click.option("--llm-model", default="deepseek-chat", help="LLM model for chunk analysis. Use 'deepseek-chat' or 'deepseek-reasoner' for DeepSeek, or 'gpt-4o' for OpenAI.")
+@click.option("--whisper-model", default="base", help="Whisper model: tiny/base/small/medium/large-v3 for local, or whisper-1 for openai.")
+@click.option("--llm-model", default="deepseek-chat", help="LLM model for chunk analysis. Use 'deepseek-chat' for DeepSeek, or 'gpt-4o' for OpenAI.")
 @click.option("--dry-run", is_flag=True, help="Show detected chunks without splitting.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose/debug logging.")
 @click.version_option(version=__version__)
 def cli(
-    input_video: Path,
+    input_path: Path,
     output_dir: Path,
     video_type: str,
     script: Path | None,
@@ -69,13 +91,10 @@ def cli(
 ) -> None:
     """Split a long video recording into labeled chunks.
 
-    INPUT_VIDEO is the path to the video file to process (MP4, MOV, etc.).
+    INPUT_PATH can be a single video file (MP4, MOV, etc.) or a directory
+    to batch-process all videos inside it.
     """
     setup_logging(verbose)
-    logger = logging.getLogger(__name__)
-
-    # Parse cue keywords
-    cue_keywords = [k.strip() for k in cues.split(",") if k.strip()]
 
     # Read script if provided
     script_text: str | None = None
@@ -83,29 +102,117 @@ def cli(
         script_text = script.read_text(encoding="utf-8")
         console.print(f"[dim]Loaded script from {script}[/dim]")
 
-    # Initialize clients — transcription uses local Whisper by default,
-    # with OpenAI API as optional fallback via --whisper-mode openai.
-    # LLM analysis client routes to DeepSeek or OpenAI based on model name.
-    import os
-    if whisper_mode == "openai":
-        whisper_client = OpenAI()
+    # Shared options dict to pass to process_video
+    opts = dict(
+        output_dir=output_dir,
+        video_type=video_type,
+        script_text=script_text,
+        cues=cues,
+        silence_duration=silence_duration,
+        silence_threshold=silence_threshold,
+        detailed=detailed,
+        whisper_mode=whisper_mode,
+        whisper_model=whisper_model,
+        llm_model=llm_model,
+        dry_run=dry_run,
+    )
+
+    # Build clients once (reuse across batch)
+    # Strip "local/" prefix for llm_model if needed before building clients
+    effective_llm_model = llm_model[len("local/"):] if llm_model.startswith("local/") else llm_model
+    whisper_client, llm_client = make_clients(whisper_mode, effective_llm_model)
+
+    if input_path.is_dir():
+        # Batch mode
+        videos = sorted([
+            f for f in input_path.iterdir()
+            if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+        ])
+
+        if not videos:
+            console.print(f"[red]No video files found in {input_path}[/red]")
+            sys.exit(1)
+
+        console.print(f"\n[bold]Batch mode:[/bold] found {len(videos)} video(s) in {input_path}\n")
+
+        failed = []
+        for i, video in enumerate(videos, 1):
+            console.rule(f"[bold cyan]{i}/{len(videos)}: {video.name}[/bold cyan]")
+            # Each video gets its own subfolder
+            video_output = output_dir / video.stem
+            try:
+                process_video(
+                    video,
+                    output_dir=video_output,
+                    video_type=video_type,
+                    script_text=script_text,
+                    cues=cues,
+                    silence_duration=silence_duration,
+                    silence_threshold=silence_threshold,
+                    detailed=detailed,
+                    whisper_mode=whisper_mode,
+                    whisper_model=whisper_model,
+                    llm_model=llm_model,
+                    dry_run=dry_run,
+                    whisper_client=whisper_client,
+                    llm_client=llm_client,
+                )
+            except Exception as e:
+                console.print(f"[red]Failed:[/red] {video.name} — {e}")
+                failed.append(video.name)
+
+        console.rule()
+        if failed:
+            console.print(f"\n[yellow]Completed with {len(failed)} failure(s):[/yellow]")
+            for f in failed:
+                console.print(f"  [red]✗[/red] {f}")
+        else:
+            console.print(f"\n[green bold]All {len(videos)} videos processed successfully![/green bold]")
+            console.print(f"Chunks saved to {output_dir}/")
     else:
-        whisper_client = None  # Not used for local mode
-    if llm_model.startswith("deepseek"):
-        llm_client = OpenAI(
-            api_key=os.environ.get("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com",
+        # Single file mode
+        process_video(
+            input_path,
+            output_dir=output_dir,
+            video_type=video_type,
+            script_text=script_text,
+            cues=cues,
+            silence_duration=silence_duration,
+            silence_threshold=silence_threshold,
+            detailed=detailed,
+            whisper_mode=whisper_mode,
+            whisper_model=whisper_model,
+            llm_model=llm_model,
+            dry_run=dry_run,
+            whisper_client=whisper_client,
+            llm_client=llm_client,
         )
-    elif llm_model.startswith("local/"):
-        # Local LM Studio — strip "local/" prefix to get the actual model id
-        llm_model = llm_model[len("local/"):]
-        llm_client = OpenAI(
-            api_key="lm-studio",
-            base_url=os.environ.get("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"),
-        )
-    else:
-        llm_client = OpenAI()
-    client = whisper_client  # kept for compatibility
+
+
+def process_video(
+    input_video: Path,
+    *,
+    output_dir: Path,
+    video_type: str,
+    script_text: str | None,
+    cues: str,
+    silence_duration: float,
+    silence_threshold: float,
+    detailed: bool,
+    whisper_mode: str,
+    whisper_model: str,
+    llm_model: str,
+    dry_run: bool,
+    whisper_client,
+    llm_client,
+) -> None:
+    """Process a single video file."""
+    logger = logging.getLogger(__name__)
+
+    # Strip "local/" prefix for llm_model if needed
+    effective_llm_model = llm_model[len("local/"):] if llm_model.startswith("local/") else llm_model
+
+    cue_keywords = [k.strip() for k in cues.split(",") if k.strip()]
 
     with Progress(
         SpinnerColumn(),
@@ -119,8 +226,7 @@ def cli(
         try:
             info = get_video_info(input_video)
         except RuntimeError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
+            raise RuntimeError(f"Probe failed: {e}") from e
 
         console.print(
             f"[bold]Input:[/bold] {input_video.name} | "
@@ -138,8 +244,7 @@ def cli(
                 silence_threshold=silence_threshold,
             )
         except RuntimeError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
+            raise RuntimeError(f"Silence detection failed: {e}") from e
 
         console.print(f"[dim]Found {len(silence_intervals)} silence intervals[/dim]")
         progress.update(task, completed=1, total=1)
@@ -154,8 +259,7 @@ def cli(
                 client=whisper_client,
             )
         except Exception as e:
-            console.print(f"[red]Transcription error:[/red] {e}")
-            sys.exit(1)
+            raise RuntimeError(f"Transcription failed: {e}") from e
 
         console.print(f"[dim]Transcript: {len(transcript.text)} chars, {len(transcript.segments)} segments[/dim]")
         progress.update(task, completed=1, total=1)
@@ -192,12 +296,11 @@ def cli(
                 chunks,
                 video_type=video_type,
                 script=script_text,
-                model=llm_model,
+                model=effective_llm_model,
                 client=llm_client,
             )
         except Exception as e:
-            console.print(f"[red]Analysis error:[/red] {e}")
-            sys.exit(1)
+            raise RuntimeError(f"LLM analysis failed: {e}") from e
         progress.update(task, completed=len(chunks))
 
     # Display results table
@@ -222,8 +325,7 @@ def cli(
         try:
             chunks = split_video(input_video, chunks, output_dir, extension=extension)
         except RuntimeError as e:
-            console.print(f"[red]Split error:[/red] {e}")
-            sys.exit(1)
+            raise RuntimeError(f"Split failed: {e}") from e
         progress.update(task, completed=len(chunks))
 
     console.print(f"\n[green bold]Done![/green bold] {len(chunks)} chunks saved to {output_dir}/")
