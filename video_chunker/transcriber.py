@@ -84,12 +84,12 @@ def _transcribe_local(
             "openai-whisper is not installed. Run: pip install openai-whisper"
         )
 
-    # Pick the best available device: CUDA > MPS (Apple Silicon) > CPU
+    # Pick the best available device: CUDA > CPU
+    # NOTE: MPS (Apple Silicon Metal) is intentionally skipped — Whisper's MPS
+    # support silently returns empty transcripts due to fp64 limitations.
     import torch
     if torch.cuda.is_available():
         device = "cuda"
-    elif torch.backends.mps.is_available():
-        device = "mps"
     else:
         device = "cpu"
 
@@ -97,15 +97,18 @@ def _transcribe_local(
 
     whisper_model = whisper.load_model(model, device=device)
 
-    # MPS (Apple Silicon) doesn't support float64 or fp16 — force fp16=False
     kwargs: dict = {
         "word_timestamps": True,
-        "fp16": device == "cuda",  # fp16 only on CUDA; MPS and CPU use fp32
+        "fp16": device == "cuda",  # fp16 only on CUDA; CPU uses fp32
     }
     if language:
         kwargs["language"] = language
 
     result = whisper_model.transcribe(str(audio_path), **kwargs)
+
+    # Sanity check — if transcript is empty, something went wrong
+    if not result.get("text", "").strip():
+        logger.warning("Whisper returned empty transcript — audio may be silent or too short")
 
     segments = []
     for seg in result.get("segments", []):
