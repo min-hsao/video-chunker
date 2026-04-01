@@ -61,7 +61,7 @@ def _make_llm_client(llm_model: str) -> OpenAI:
 
 @click.command()
 @click.argument("input_path", type=click.Path(exists=True, path_type=Path))
-@click.option("-o", "--output", "output_dir", type=click.Path(path_type=Path), default="./chunks", help="Output directory for chunks.")
+@click.option("-o", "--output", "output_dir", type=click.Path(path_type=Path), default=None, help="Output directory for chunks. Defaults to a 'chunks' folder next to the source video/directory.")
 @click.option("--type", "video_type", default="product-demo", help="Video type: product-demo, tutorial, talking-head, or custom string.")
 @click.option("--script", type=click.Path(exists=True, path_type=Path), default=None, help="Path to draft script file for comparison.")
 @click.option("--cues", default="cut,next,take", help="Comma-separated verbal cue keywords that force a split.")
@@ -97,6 +97,10 @@ def cli(
     to batch-process all videos inside it.
     """
     setup_logging(verbose)
+
+    # Default output: "chunks" folder next to the source video/directory
+    if output_dir is None:
+        output_dir = input_path.parent / "chunks"
 
     script_text: str | None = None
     if script:
