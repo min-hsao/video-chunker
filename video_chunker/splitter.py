@@ -94,13 +94,18 @@ def compute_split_points(
             for point, is_cue in deduped
         ]
 
-    # Filter out points too close to start/end
-    MIN_CHUNK_DURATION = 2.0
-    deduped = [
-        (point, is_cue)
-        for point, is_cue in deduped
-        if point > MIN_CHUNK_DURATION and point < video_duration - MIN_CHUNK_DURATION
-    ]
+    # Filter out points that would create chunks shorter than minimum duration.
+    # Short micro-chunks (< 10s) are usually gaps, hesitations, or false splits —
+    # not meaningful takes. Cue-triggered splits are exempt.
+    MIN_CHUNK_DURATION = 10.0
+    filtered: list[tuple[float, bool]] = []
+    boundaries = [0.0] + [p for p, _ in deduped] + [video_duration]
+    for i, (point, is_cue) in enumerate(deduped):
+        chunk_before = point - boundaries[i]
+        chunk_after = boundaries[i + 2] - point
+        if is_cue or (chunk_before >= MIN_CHUNK_DURATION and chunk_after >= MIN_CHUNK_DURATION):
+            filtered.append((point, is_cue))
+    deduped = filtered
 
     return deduped
 
