@@ -30,6 +30,7 @@ class ChunkInfo:
     analysis: ChunkAnalysis | None = None
     output_path: str = ""
     cue_triggered: bool = False
+    retake: bool = False  # True if this chunk was split off as a detected retake
 
 
 def analyze_chunk(

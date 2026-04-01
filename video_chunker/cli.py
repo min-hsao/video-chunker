@@ -329,7 +329,7 @@ def _print_chunks_table(chunks: list[ChunkInfo]) -> None:
     table.add_column("Duration", width=10)
     table.add_column("Description", width=30)
     table.add_column("Status", width=12)
-    table.add_column("Cue?", width=5)
+    table.add_column("Split", width=8)
 
     for chunk in chunks:
         time_range = f"{_format_time(chunk.start)} - {_format_time(chunk.end)}"
@@ -342,8 +342,14 @@ def _print_chunks_table(chunks: list[ChunkInfo]) -> None:
             desc = "—"
             status = "—"
 
-        cue = "[cyan]yes[/cyan]" if chunk.cue_triggered else ""
-        table.add_row(str(chunk.index + 1), time_range, duration_str, desc, status, cue)
+        if chunk.retake:
+            split_reason = "[magenta]retake[/magenta]"
+        elif chunk.cue_triggered:
+            split_reason = "[cyan]cue[/cyan]"
+        else:
+            split_reason = "[dim]silence[/dim]"
+
+        table.add_row(str(chunk.index + 1), time_range, duration_str, desc, status, split_reason)
 
     console.print(table)
 
