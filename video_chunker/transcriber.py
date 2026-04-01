@@ -97,7 +97,11 @@ def _transcribe_local(
 
     whisper_model = whisper.load_model(model, device=device)
 
-    kwargs: dict = {"word_timestamps": True}
+    # MPS (Apple Silicon) doesn't support float64 or fp16 — force fp16=False
+    kwargs: dict = {
+        "word_timestamps": True,
+        "fp16": device == "cuda",  # fp16 only on CUDA; MPS and CPU use fp32
+    }
     if language:
         kwargs["language"] = language
 
