@@ -241,20 +241,33 @@ def is_mid_sentence(transcript: Transcript, time: float, tolerance: float = 1.0)
 def find_sentence_boundary(
     transcript: Transcript,
     time: float,
-    search_window: float = 3.0,
+    search_window: float = 8.0,
 ) -> float | None:
-    """Find the nearest sentence boundary to a given timestamp."""
-    candidates: list[float] = []
+    """Find the nearest sentence boundary to a given timestamp.
+
+    Prefers:
+    1. End of a segment that ends with sentence-ending punctuation (.!?)
+    2. Start of any segment (speaker begins a new thought)
+    Both must be within search_window seconds of the target time.
+    """
+    sentence_ends: list[float] = []
+    segment_starts: list[float] = []
 
     for seg in transcript.segments:
+        # Segment end with punctuation = clean sentence boundary
         if abs(seg.end - time) <= search_window:
             text = seg.text.strip()
-            if text and text[-1] in ".!?":
-                candidates.append(seg.end)
+            if text and text[-1] in ".!?,":
+                sentence_ends.append(seg.end)
+
+        # Segment start = beginning of new utterance (also a valid cut point)
         if abs(seg.start - time) <= search_window:
-            candidates.append(seg.start)
+            segment_starts.append(seg.start)
 
-    if not candidates:
-        return None
+    # Prefer sentence-ending boundaries first, then segment starts
+    if sentence_ends:
+        return min(sentence_ends, key=lambda t: abs(t - time))
+    if segment_starts:
+        return min(segment_starts, key=lambda t: abs(t - time))
 
-    return min(candidates, key=lambda t: abs(t - time))
+    return None

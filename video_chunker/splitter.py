@@ -50,18 +50,23 @@ def compute_split_points(
     """
     raw_points: list[tuple[float, bool]] = []
 
-    # Add silence-based split points (using midpoint of silence)
+    # Add silence-based split points.
+    # Strategy: use the END of silence (when speech resumes) as the split point.
+    # This guarantees the cut lands inside an actual audio gap — never mid-word.
+    # Then try to nudge to a sentence boundary in the transcript.
     for interval in silence_intervals:
-        point = interval.midpoint
-        # Validate against transcript - don't split mid-sentence
-        if is_mid_sentence(transcript, point):
-            boundary = find_sentence_boundary(transcript, point)
-            if boundary is not None:
-                logger.debug(
-                    "Adjusted split point from %.1f to %.1f (sentence boundary)",
-                    point, boundary,
-                )
-                point = boundary
+        # Prefer end of silence (speech resumes) over midpoint
+        point = interval.end
+
+        # Try to find a nearby sentence boundary in transcript (±8s window)
+        boundary = find_sentence_boundary(transcript, point, search_window=8.0)
+        if boundary is not None and abs(boundary - point) <= 8.0:
+            logger.debug(
+                "Adjusted split point from %.1f to %.1f (sentence boundary)",
+                point, boundary,
+            )
+            point = boundary
+
         raw_points.append((point, False))
 
     # Add cue-based split points (these force a split regardless)
