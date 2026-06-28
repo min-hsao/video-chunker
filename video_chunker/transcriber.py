@@ -36,6 +36,7 @@ class TranscriptSegment:
 class Transcript:
     text: str
     segments: list[TranscriptSegment]
+    words: list[WordSegment] | None = None
 
 
 def transcribe_audio(
@@ -111,16 +112,26 @@ def _transcribe_local(
         logger.warning("Whisper returned empty transcript — audio may be silent or too short")
 
     segments = []
+    all_words: list[WordSegment] = []
+
     for seg in result.get("segments", []):
         segments.append(TranscriptSegment(
             text=seg.get("text", "").strip(),
             start=float(seg.get("start", 0.0)),
             end=float(seg.get("end", 0.0)),
         ))
+        # Extract word-level timestamps if available
+        for w in seg.get("words", []):
+            all_words.append(WordSegment(
+                word=w.get("word", "").strip(),
+                start=float(w.get("start", 0.0)),
+                end=float(w.get("end", 0.0)),
+            ))
 
     return Transcript(
         text=result.get("text", "").strip(),
         segments=segments,
+        words=all_words if all_words else None,
     )
 
 
@@ -153,7 +164,7 @@ def _transcribe_openai_file(
     kwargs: dict = {
         "model": model,
         "response_format": "verbose_json",
-        "timestamp_granularities": ["segment"],
+        "timestamp_granularities": ["word", "segment"],
     }
     if language:
         kwargs["language"] = language
@@ -162,6 +173,8 @@ def _transcribe_openai_file(
         response = client.audio.transcriptions.create(file=f, **kwargs)
 
     segments = []
+    all_words: list[WordSegment] = []
+
     for seg in getattr(response, "segments", []) or []:
         if isinstance(seg, dict):
             text, start, end = seg.get("text", "").strip(), seg.get("start", 0.0), seg.get("end", 0.0)
@@ -169,9 +182,25 @@ def _transcribe_openai_file(
             text, start, end = seg.text.strip(), seg.start, seg.end
         segments.append(TranscriptSegment(text=text, start=float(start), end=float(end)))
 
+    # Extract word-level timestamps if available
+    for w in getattr(response, "words", []) or []:
+        if isinstance(w, dict):
+            all_words.append(WordSegment(
+                word=w.get("word", "").strip(),
+                start=float(w.get("start", 0.0)),
+                end=float(w.get("end", 0.0)),
+            ))
+        else:
+            all_words.append(WordSegment(
+                word=getattr(w, "word", "").strip(),
+                start=float(getattr(w, "start", 0.0)),
+                end=float(getattr(w, "end", 0.0)),
+            ))
+
     return Transcript(
         text=response.text.strip(),
         segments=segments,
+        words=all_words if all_words else None,
     )
 
 
@@ -192,6 +221,7 @@ def _transcribe_openai_large_file(
     total_duration = float(result.stdout.strip())
 
     all_segments: list[TranscriptSegment] = []
+    all_words: list[WordSegment] = []
     all_text_parts: list[str] = []
     offset = 0.0
 
@@ -208,6 +238,13 @@ def _transcribe_openai_large_file(
                 seg.start += offset
                 seg.end += offset
                 all_segments.append(seg)
+            if transcript.words:
+                for w in transcript.words:
+                    all_words.append(WordSegment(
+                        word=w.word,
+                        start=w.start + offset,
+                        end=w.end + offset,
+                    ))
             all_text_parts.append(transcript.text)
         finally:
             chunk_path.unlink(missing_ok=True)
@@ -216,6 +253,7 @@ def _transcribe_openai_large_file(
     return Transcript(
         text=" ".join(all_text_parts),
         segments=all_segments,
+        words=all_words if all_words else None,
     )
 
 
@@ -229,7 +267,26 @@ def get_transcript_at_time(transcript: Transcript, time: float, window: float = 
 
 
 def is_mid_sentence(transcript: Transcript, time: float, tolerance: float = 1.0) -> bool:
-    """Check if a timestamp falls in the middle of a sentence."""
+    """Check if a timestamp falls in the middle of a sentence.
+
+    With word-level timestamps, checks if the nearest word ends with
+    sentence-ending punctuation. Falls back to segment-level check.
+    """
+    if transcript.words:
+        # Find the word closest to the target time
+        best_word = None
+        best_dist = float("inf")
+        for w in transcript.words:
+            mid = (w.start + w.end) / 2
+            dist = abs(mid - time)
+            if dist < best_dist:
+                best_dist = dist
+                best_word = w
+        if best_word and best_dist <= tolerance:
+            return not best_word.word.endswith((".", "!", "?", ","))
+        return False
+
+    # Fallback: segment-level
     for seg in transcript.segments:
         if seg.start + tolerance < time < seg.end - tolerance:
             text = seg.text.strip()
@@ -245,26 +302,40 @@ def find_sentence_boundary(
 ) -> float | None:
     """Find the nearest sentence boundary to a given timestamp.
 
-    Prefers:
-    1. End of a segment that ends with sentence-ending punctuation (.!?)
-    2. Start of any segment (speaker begins a new thought)
-    Both must be within search_window seconds of the target time.
+    With word-level timestamps, finds the end of the nearest word ending
+    with sentence punctuation -- much more precise than segment boundaries.
+    Falls back to segment-level boundaries if words are not available.
     """
+    # ── Word-level boundary detection ─────────────────────────────────────
+    if transcript.words:
+        word_ends: list[float] = []
+        word_starts: list[float] = []
+
+        for w in transcript.words:
+            # Word ending with sentence punctuation = precise cut point
+            if abs(w.end - time) <= search_window and w.word[-1:] in ".!?,":
+                word_ends.append(w.end)
+            # Word start after time = start of new utterance
+            if w.start > time and abs(w.start - time) <= search_window:
+                word_starts.append(w.start)
+
+        if word_ends:
+            return min(word_ends, key=lambda t: abs(t - time))
+        if word_starts:
+            return min(word_starts, key=lambda t: abs(t - time))
+
+    # ── Segment-level fallback ────────────────────────────────────────────
     sentence_ends: list[float] = []
     segment_starts: list[float] = []
 
     for seg in transcript.segments:
-        # Segment end with punctuation = clean sentence boundary
         if abs(seg.end - time) <= search_window:
             text = seg.text.strip()
             if text and text[-1] in ".!?,":
                 sentence_ends.append(seg.end)
-
-        # Segment start = beginning of new utterance (also a valid cut point)
         if abs(seg.start - time) <= search_window:
             segment_starts.append(seg.start)
 
-    # Prefer sentence-ending boundaries first, then segment starts
     if sentence_ends:
         return min(sentence_ends, key=lambda t: abs(t - time))
     if segment_starts:

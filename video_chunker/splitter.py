@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -282,3 +283,311 @@ def split_video(
         split_video_segment(video_path, output_path, start=chunk.start, end=chunk.end)
 
     return chunks
+
+
+# ── Clean mode: remove filler words, silences, retakes and stitch ───────────
+
+# Common filler words/phrases to detect
+FILLER_PHRASES: list[str] = [
+    "um", "uh", "ah", "er", "hmm", "huh",
+    "you know", "like", "I mean", "so yeah",
+    "basically", "literally", "actually",
+    "kind of", "sort of",
+]
+
+# Minimum gap to keep between segments (avoid cutting into speech)
+MIN_KEEP_DURATION = 0.3
+
+
+def _is_filler_segment(text: str) -> bool:
+    """Check if a transcript segment is purely a filler word/phrase."""
+    cleaned = text.strip().lower().rstrip(".,!?;:")
+    return cleaned in FILLER_PHRASES
+
+
+def _is_retake_segment(
+    seg_index: int,
+    transcript: Transcript,
+) -> bool:
+    """Check if a segment is a retake of a previous segment."""
+    segments = transcript.segments
+    if seg_index >= len(segments):
+        return False
+
+    current = segments[seg_index]
+    current_start = _first_words(current.text, RETAKE_COMPARE_WORDS)
+    if not current_start:
+        return False
+
+    for j in range(seg_index - 1, -1, -1):
+        prev = segments[j]
+        if current.start - prev.start > 60.0:
+            break
+        prev_start = _first_words(prev.text, RETAKE_COMPARE_WORDS)
+        if not prev_start:
+            continue
+        similarity = SequenceMatcher(None, current_start, prev_start).ratio()
+        if similarity >= RETAKE_SIMILARITY_THRESHOLD:
+            return True
+
+    return False
+
+
+@dataclass
+class CleanSegment:
+    """A 'good' segment to keep in the cleaned output."""
+    start: float
+    end: float
+    reason: str  # "kept" | "speech"
+
+
+def compute_clean_segments(
+    transcript: Transcript,
+    silence_intervals: list[SilenceInterval],
+    video_duration: float,
+    *,
+    min_silence_to_cut: float = 1.0,
+    remove_retakes: bool = True,
+) -> list[CleanSegment]:
+    """Identify the 'good' segments to keep after removing filler, silence, and retakes.
+
+    Returns a list of CleanSegment representing the parts to keep.
+    The gaps between these segments are what gets cut.
+    """
+    # Build a set of time ranges to cut
+    cut_ranges: list[tuple[float, float, str]] = []  # (start, end, reason)
+
+    # ── 1. Cut silence intervals ──────────────────────────────────────────
+    for si in silence_intervals:
+        if si.duration >= min_silence_to_cut:
+            cut_ranges.append((si.start, si.end, "silence"))
+
+    # ── 2. Cut filler word segments ───────────────────────────────────────
+    for seg in transcript.segments:
+        if _is_filler_segment(seg.text):
+            cut_ranges.append((seg.start, seg.end, "filler"))
+
+    # ── 3. Cut retakes ────────────────────────────────────────────────────
+    if remove_retakes:
+        for i in range(len(transcript.segments)):
+            if _is_retake_segment(i, transcript):
+                seg = transcript.segments[i]
+                cut_ranges.append((seg.start, seg.end, "retake"))
+
+    # ── Merge overlapping cut ranges ──────────────────────────────────────
+    if not cut_ranges:
+        # Nothing to cut — keep the whole video
+        return [CleanSegment(start=0.0, end=video_duration, reason="kept")]
+
+    cut_ranges.sort(key=lambda x: x[0])
+    merged: list[tuple[float, float, str]] = [cut_ranges[0]]
+    for start, end, reason in cut_ranges[1:]:
+        prev_start, prev_end, prev_reason = merged[-1]
+        if start <= prev_end:
+            # Overlapping or adjacent — merge
+            merged[-1] = (prev_start, max(prev_end, end), prev_reason)
+        else:
+            merged.append((start, end, reason))
+
+    # ── Build keep segments (inverse of cut ranges) ───────────────────────
+    keep: list[CleanSegment] = []
+    cursor = 0.0
+
+    for cut_start, cut_end, reason in merged:
+        if cut_start - cursor >= MIN_KEEP_DURATION:
+            keep.append(CleanSegment(start=cursor, end=cut_start, reason="speech"))
+        cursor = cut_end
+
+    # Trailing segment after last cut
+    if video_duration - cursor >= MIN_KEEP_DURATION:
+        keep.append(CleanSegment(start=cursor, end=video_duration, reason="speech"))
+
+    if not keep:
+        # Edge case: entire video was cut — keep it all
+        keep.append(CleanSegment(start=0.0, end=video_duration, reason="kept"))
+
+    return keep
+
+
+def clean_video(
+    video_path: Path,
+    transcript: Transcript,
+    silence_intervals: list[SilenceInterval],
+    output_path: Path,
+    *,
+    min_silence_to_cut: float = 1.0,
+    remove_retakes: bool = True,
+) -> dict:
+    """Remove filler words, silences, and retakes from a video.
+
+    Outputs a single cleaned file with the bad parts cut out.
+
+    Returns a summary dict with stats.
+    """
+    info_cmd = __import__("subprocess").run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+         "-of", "csv=print_section=0", str(video_path)],
+        capture_output=True, text=True, check=True,
+    )
+    video_duration = float(info_cmd.stdout.strip())
+
+    keep_segments = compute_clean_segments(
+        transcript,
+        silence_intervals,
+        video_duration,
+        min_silence_to_cut=min_silence_to_cut,
+        remove_retakes=remove_retakes,
+    )
+
+    original_duration = video_duration
+    kept_duration = sum(s.end - s.start for s in keep_segments)
+    cut_duration = original_duration - kept_duration
+
+    logger.info(
+        "Clean mode: keeping %.1fs of %.1fs (cut %.1fs / %.0f%%)",
+        kept_duration, original_duration, cut_duration,
+        (cut_duration / original_duration * 100) if original_duration > 0 else 0,
+    )
+
+    if len(keep_segments) == 1 and keep_segments[0].start == 0.0 and abs(keep_segments[0].end - video_duration) < 0.5:
+        # Nothing to cut — just copy
+        import shutil
+        shutil.copy2(video_path, output_path)
+        logger.info("No cuts needed — copied original file")
+        return {
+            "original_duration": original_duration,
+            "clean_duration": kept_duration,
+            "cut_duration": 0.0,
+            "segments_kept": 1,
+            "cuts_made": 0,
+        }
+
+    # Create individual clips then concat
+    import tempfile
+    tmpdir = Path(tempfile.mkdtemp(prefix="vclean_"))
+    clip_list = tmpdir / "concat.txt"
+
+    try:
+        # Write each keep segment as a clip
+        clip_paths: list[Path] = []
+        for i, seg in enumerate(keep_segments):
+            clip_path = tmpdir / f"keep_{i:04d}.mp4"
+            split_video_segment(video_path, clip_path, start=seg.start, end=seg.end)
+            clip_paths.append(clip_path)
+
+        # Write concat list
+        with open(clip_list, "w") as f:
+            for cp in clip_paths:
+                f.write(f"file '{cp}'\n")
+
+        # Concatenate with stream copy
+        import subprocess
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+             "-i", str(clip_list), "-c", "copy",
+             "-movflags", "+faststart", str(output_path)],
+            capture_output=True, text=True, check=True,
+        )
+
+    finally:
+        # Cleanup temp files
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return {
+        "original_duration": original_duration,
+        "clean_duration": kept_duration,
+        "cut_duration": cut_duration,
+        "segments_kept": len(keep_segments),
+        "cuts_made": len(keep_segments) - 1,
+    }
+
+
+def compute_clean_segments_llm(
+    transcript: Transcript,
+    silence_intervals: list[SilenceInterval],
+    video_duration: float,
+    *,
+    llm_retakes: list | None = None,
+    llm_fillers: list | None = None,
+    llm_content_cuts: list | None = None,
+    min_silence_to_cut: float = 1.0,
+    remove_retakes: bool = True,
+) -> list[CleanSegment]:
+    """Enhanced clean mode using LLM analysis results.
+
+    Like compute_clean_segments but integrates:
+    - LLM retake detection (replaces string similarity)
+    - LLM filler detection (replaces hardcoded word list)
+    - LLM content cut suggestions (tangents, redundancy, etc.)
+    """
+    cut_ranges: list[tuple[float, float, str]] = []  # (start, end, reason)
+
+    # ── 1. Cut silence intervals ──────────────────────────────────────────
+    for si in silence_intervals:
+        if si.duration >= min_silence_to_cut:
+            cut_ranges.append((si.start, si.end, "silence"))
+
+    # ── 2. LLM filler detection (preferred) or fallback ──────────────────
+    if llm_fillers:
+        from .analyzer import FillerDetection
+        for fd in llm_fillers:
+            if isinstance(fd, FillerDetection) and fd.is_filler:
+                cut_ranges.append((fd.start, fd.end, f"filler: {fd.reason}"))
+    else:
+        # Fallback to hardcoded filler detection
+        for seg in transcript.segments:
+            if _is_filler_segment(seg.text):
+                cut_ranges.append((seg.start, seg.end, "filler"))
+
+    # ── 3. LLM retake detection (preferred) or fallback ──────────────────
+    if remove_retakes:
+        if llm_retakes:
+            from .analyzer import RetakeDetection
+            for rd in llm_retakes:
+                if isinstance(rd, RetakeDetection) and rd.is_retake:
+                    cut_ranges.append((rd.timestamp, rd.timestamp + 0.1, f"retake: {rd.reason}"))
+        else:
+            # Fallback to string similarity retake detection
+            for i in range(len(transcript.segments)):
+                if _is_retake_segment(i, transcript):
+                    seg = transcript.segments[i]
+                    cut_ranges.append((seg.start, seg.end, "retake"))
+
+    # ── 4. LLM content cut suggestions ────────────────────────────────────
+    if llm_content_cuts:
+        from .analyzer import ContentCutSuggestion
+        for cc in llm_content_cuts:
+            if isinstance(cc, ContentCutSuggestion):
+                cut_ranges.append((cc.start, cc.end, f"content: {cc.reason}"))
+
+    # ── Merge overlapping cut ranges ──────────────────────────────────────
+    if not cut_ranges:
+        return [CleanSegment(start=0.0, end=video_duration, reason="kept")]
+
+    cut_ranges.sort(key=lambda x: x[0])
+    merged: list[tuple[float, float, str]] = [cut_ranges[0]]
+    for start, end, reason in cut_ranges[1:]:
+        prev_start, prev_end, prev_reason = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end), prev_reason)
+        else:
+            merged.append((start, end, reason))
+
+    # ── Build keep segments (inverse of cut ranges) ───────────────────────
+    keep: list[CleanSegment] = []
+    cursor = 0.0
+
+    for cut_start, cut_end, reason in merged:
+        if cut_start - cursor >= MIN_KEEP_DURATION:
+            keep.append(CleanSegment(start=cursor, end=cut_start, reason="speech"))
+        cursor = cut_end
+
+    # Trailing segment after last cut
+    if video_duration - cursor >= MIN_KEEP_DURATION:
+        keep.append(CleanSegment(start=cursor, end=video_duration, reason="speech"))
+
+    if not keep:
+        keep.append(CleanSegment(start=0.0, end=video_duration, reason="kept"))
+
+    return keep
