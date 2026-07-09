@@ -53,3 +53,6 @@ chunks/
 *.wav
 *.mp3
 *.m4a
+
+# Scratch / QC reports
+.qc/
