@@ -28,10 +28,12 @@ from .splitter import (
     MIN_CHUNK_DURATION, build_chunks, clean_video, compute_split_points, split_video,
     compute_clean_segments_llm,
 )
+from .metadata import extract_metadata, metadata_summary
 from .transcriber import transcribe_audio
 from .transcriber import Transcript
 from .utils import SilenceInterval, detect_silence, get_keyframes, get_video_info, qc_file, QCResult, generate_contact_sheet
 
+logger = logging.getLogger(__name__)
 console = Console()
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
@@ -252,6 +254,10 @@ def _auto_tune_silence(
 @click.option("--smart-clean", is_flag=True, help="Use LLM for content-aware clean mode — removes tangents, redundancy, off-topic chatter. (Requires --clean)")
 @click.option("--contact-sheet", is_flag=True, help="Generate a thumbnail contact sheet (JPEG) for each chunk after splitting.")
 @click.option("--qc", is_flag=True, help="Run ffprobe quality control on each output file after splitting.")
+@click.option("--metadata/--no-metadata", default=True, help="Extract embedded camera/GPS metadata from video files (default: on).")
+@click.option("--redact-gps", is_flag=True, help="Exclude raw GPS coordinates from manifest/output; use place names only.")
+@click.option("--sidecar", is_flag=True, help="Write per-chunk JSON sidecar files alongside output clips.")
+@click.option("--geocode", default="off", type=click.Choice(["off", "offline", "online"], case_sensitive=False), help="Reverse-geocode GPS to place names: off (default), offline (bundled dataset), or online (Nominatim API).")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose/debug logging.")
 @click.version_option(version=__version__)
 def cli(
@@ -278,6 +284,10 @@ def cli(
     smart_clean: bool,
     contact_sheet: bool,
     qc: bool,
+    metadata: bool,
+    redact_gps: bool,
+    sidecar: bool,
+    geocode: str,
     verbose: bool,
 ) -> None:
     """Split a long video recording into labeled chunks.
@@ -346,6 +356,10 @@ def cli(
                     smart_clean=smart_clean,
                     contact_sheet=contact_sheet,
                     qc=qc,
+                    metadata=metadata,
+                    redact_gps=redact_gps,
+                    sidecar=sidecar,
+                    geocode=geocode,
                     whisper_client=whisper_client,
                     llm_client=llm_client,
                 )
@@ -388,6 +402,10 @@ def cli(
             smart_clean=smart_clean,
             contact_sheet=contact_sheet,
             qc=qc,
+            metadata=metadata,
+            redact_gps=redact_gps,
+            sidecar=sidecar,
+            geocode=geocode,
             whisper_client=whisper_client,
             llm_client=llm_client,
         )
@@ -418,11 +436,14 @@ def process_video(
     smart_clean: bool,
     contact_sheet: bool,
     qc: bool,
+    metadata: bool,
+    redact_gps: bool,
+    sidecar: bool,
+    geocode: str,
     whisper_client: OpenAI | None,
     llm_client: OpenAI,
 ) -> None:
     """Process a single video file end-to-end."""
-    logger = logging.getLogger(__name__)
     cue_keywords = [k.strip() for k in cues.split(",") if k.strip()]
 
     with Progress(
@@ -444,6 +465,29 @@ def process_video(
             f"{info.duration:.1f}s | {info.fps:.1f}fps"
         )
         progress.update(task, completed=1, total=1)
+
+        # Step 1b: Extract embedded metadata (EXIF/GPS/camera)
+        video_meta = None
+        if metadata:
+            task = progress.add_task("Extracting metadata...", total=None)
+            from .metadata import extract_metadata, enrich_with_exiftool, metadata_summary
+            from .geocode import reverse_geocode, GeocodeCache
+            video_meta = extract_metadata(input_video)
+            # Tier 2: enrich with exiftool if available
+            video_meta = enrich_with_exiftool(input_video, video_meta)
+            # Reverse-geocode GPS if requested
+            if geocode != "off" and video_meta.gps and video_meta.gps.is_valid():
+                geo_cache = GeocodeCache()
+                loc = reverse_geocode(video_meta.gps, mode=geocode, cache=geo_cache)
+                if loc:
+                    video_meta.location = loc
+                    console.print(f"[dim]Location: {loc.name}[/dim]")
+            summary = metadata_summary(video_meta)
+            if video_meta.has_any():
+                console.print(f"[dim]Metadata: {summary}[/dim]")
+            else:
+                console.print(f"[dim]Metadata: {summary}[/dim]")
+            progress.update(task, completed=1, total=1)
 
         # Step 2: Detect silence (or auto-tune)
         if auto_tune:
@@ -612,12 +656,18 @@ def process_video(
     ) as progress:
         task = progress.add_task("Analyzing chunks...", total=len(chunks))
         try:
+            # Build recording context from metadata for the LLM
+            recording_context = ""
+            if video_meta and video_meta.has_any():
+                recording_context = video_meta.prompt_context(redact_gps=redact_gps)
+
             chunks = analyze_chunks(
                 chunks,
                 video_type=video_type,
                 script=script_text,
                 model=llm_model,
                 client=llm_client,
+                recording_context=recording_context,
             )
         except Exception as e:
             raise RuntimeError(f"LLM analysis failed: {e}") from e
@@ -628,7 +678,7 @@ def process_video(
     if dry_run:
         console.print("\n[yellow]Dry run \u2014 no files written.[/yellow]")
         if detailed:
-            _print_manifest(chunks, input_video, info)
+            _print_manifest(chunks, input_video, info, video_meta=video_meta, redact_gps=redact_gps, sidecar=sidecar, output_dir=output_dir)
         return
 
     # Step 8: Split
@@ -725,7 +775,7 @@ def process_video(
             console.print("[red bold]Some chunks failed QC — check errors above.[/red bold]")
 
     if detailed:
-        _print_manifest(chunks, input_video, info)
+        _print_manifest(chunks, input_video, info, video_meta=video_meta, redact_gps=redact_gps, sidecar=sidecar, output_dir=output_dir)
 
 
 def _process_clean(
@@ -881,7 +931,7 @@ def _print_chunks_table(chunks: list[ChunkInfo]) -> None:
     console.print(table)
 
 
-def _print_manifest(chunks: list[ChunkInfo], input_video: Path, info) -> None:
+def _print_manifest(chunks: list[ChunkInfo], input_video: Path, info, video_meta=None, redact_gps: bool = False, sidecar: bool = False, output_dir: Path | None = None) -> None:
     manifest = {
         "input": str(input_video),
         "video_info": {
@@ -892,6 +942,10 @@ def _print_manifest(chunks: list[ChunkInfo], input_video: Path, info) -> None:
         },
         "chunks": [],
     }
+
+    # Add embedded metadata if available
+    if video_meta and video_meta.has_any():
+        manifest["metadata"] = video_meta.to_dict(redact_gps=redact_gps)
 
     for chunk in chunks:
         chunk_data: dict = {
@@ -926,6 +980,52 @@ def _print_manifest(chunks: list[ChunkInfo], input_video: Path, info) -> None:
                 "errors": r.errors,
             }
         manifest["chunks"].append(chunk_data)
+
+    # Write manifest.json to output dir if we have one
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = output_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info("Manifest written to %s", manifest_path)
+
+    # Write sidecar JSONs if requested
+    if sidecar and output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for chunk in chunks:
+            if not chunk.output_path:
+                continue
+            sidecar_path = Path(chunk.output_path).with_suffix(".json")
+            chunk_json = {
+                "index": chunk.index + 1,
+                "start": chunk.start,
+                "end": chunk.end,
+                "duration": chunk.duration,
+                "transcript": chunk.transcript,
+                "output_path": chunk.output_path,
+            }
+            if chunk.analysis:
+                chunk_json["analysis"] = {
+                    "description": chunk.analysis.description,
+                    "is_complete": chunk.analysis.is_complete,
+                    "confidence": chunk.analysis.confidence,
+                    "notes": chunk.analysis.notes,
+                    "script_match": chunk.analysis.script_match,
+                }
+            if video_meta and video_meta.has_any():
+                chunk_json["metadata"] = video_meta.to_dict(redact_gps=redact_gps)
+            if chunk.qc_result:
+                r = chunk.qc_result
+                chunk_json["qc"] = {
+                    "passed": len(r.errors) == 0,
+                    "duration": r.duration,
+                    "expected_duration": r.expected_duration,
+                    "resolution": f"{r.width}x{r.height}",
+                    "has_video": r.has_video,
+                    "has_audio": r.has_audio,
+                    "file_size_mb": round(r.file_size_mb, 2),
+                    "errors": r.errors,
+                }
+            sidecar_path.write_text(json.dumps(chunk_json, indent=2, ensure_ascii=False), encoding="utf-8")
 
     console.print("\n[bold]Manifest:[/bold]")
     console.print_json(json.dumps(manifest, indent=2))

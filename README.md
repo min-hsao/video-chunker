@@ -13,6 +13,11 @@ Designed for creators who record multiple takes in a single session — product 
 - **Lossless output** — splits use `-c copy` (stream copy) cutting on the nearest keyframe — no re-encoding
 - **Smart naming** — output files are named `001_brief_description_complete.mp4`
 - **Rich CLI** — progress bars, color output, and a detailed JSON manifest option
+- **EXIF/metadata aware** — extracts camera model, GPS coordinates, creation time, and lens info from video files using ffprobe and optional exiftool
+- **Reverse-geocode** — optionally convert GPS coordinates to place names (offline via bundled dataset, or online via OpenStreetMap/Nominatim)
+- **Context-aware labeling** — feeds camera/location/date context to the LLM for smarter chunk descriptions (e.g. `shoreditch_street_intro_complete.mp4`)
+- **Sidecar JSONs** — per-chunk metadata files with transcript, analysis, GPS, camera info, and QC results
+- **GPS redaction** — `--redact-gps` excludes raw coordinates from outputs, using place names only
 
 ## Requirements
 
@@ -21,6 +26,8 @@ Designed for creators who record multiple takes in a single session — product 
 - For local Whisper mode: None required (runs on your machine)
 - For OpenAI Whisper mode: An [OpenAI API key](https://platform.openai.com/api-keys) set as `OPENAI_API_KEY`
 - For LLM analysis (optional): `DEEPSEEK_API_KEY` for DeepSeek models, or `OPENAI_API_KEY` for GPT-4o
+- For exiftool enrichment (optional): [exiftool](https://exiftool.org/) installed and on your PATH — auto-detected if available
+- For offline reverse-geocoding (optional): `pip install 'video-chunker[geo]'` (installs `reverse_geocoder`)
 
 ## Installation
 
@@ -126,10 +133,43 @@ Options:
   --whisper-model TEXT        Whisper model: tiny/base/small/medium/large-v3 (local) or whisper-1/whisper-large-v3 (openai) (default: base)
   --llm-model TEXT            LLM model for analysis (default: deepseek-chat)
   --dry-run                   Show detected chunks without splitting
+  --metadata/--no-metadata     Extract embedded camera/GPS metadata (default: on)
+  --geocode [off|offline|online]  Reverse-geocode GPS to place names (default: off)
+  --redact-gps                Exclude raw GPS coordinates from outputs
+  --sidecar                   Write per-chunk JSON sidecar files
   -v, --verbose               Enable debug logging
-  --version                   Show version
+  --version                   Show this message and exit
   --help                      Show this message and exit
 ```
+
+## EXIF & GPS Metadata
+
+video-chunker extracts embedded metadata from video files in two tiers:
+
+1. **ffprobe (always available)** — reads GPS coordinates (ISO 6709), creation time, camera make/model, and software from QuickTime/MP4 container tags.
+2. **exiftool (auto-detected)** — fills gaps with lens info, Fuji/Canon/Nikon maker notes, GoPro/DJI GPS variants, and timezone offset data.
+
+### Reverse-geocoding
+
+When GPS data is present, you can convert coordinates to place names:
+
+```bash
+# Offline (bundled dataset, no network, city-level)
+pip install 'video-chunker[geo]'
+video-chunker recording.mp4 --geocode offline
+
+# Online (OpenStreetMap Nominatim, neighborhood-level)
+video-chunker recording.mp4 --geocode online
+```
+
+Geocode results are cached at `~/.cache/video-chunker/geocode.json` to avoid repeat lookups.
+
+### Privacy
+
+- Raw GPS coordinates are never sent to the LLM — only derived place names, dates, and camera info.
+- Use `--redact-gps` to exclude coordinates from manifest/sidecar files entirely.
+- Location data is only sent to DeepSeek/OpenAI if you use their API. Use `--llm-model local/...` for fully local processing.
+- Online geocoding uses OpenStreetMap's Nominatim API with a proper User-Agent and rate limiting.
 
 ## Output
 

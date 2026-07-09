@@ -31,10 +31,10 @@ class ChunkInfo:
     # Extended metadata (added in v3)
     contact_sheet_path: str | None = None
     qc_result: object | None = None
-    output_path: str | None = None
     output_path: str = ""
     cue_triggered: bool = False
     retake: bool = False  # True if this chunk was split off as a detected retake
+    metadata: object | None = None  # VideoMetadata from the source video
 
 
 def analyze_chunk(
@@ -44,6 +44,7 @@ def analyze_chunk(
     script: str | None = None,
     model: str = "deepseek-chat",
     client: OpenAI | None = None,
+    recording_context: str = "",
 ) -> ChunkAnalysis:
     """Analyze a chunk transcript using an LLM to determine completeness and description."""
     if client is None:
@@ -74,6 +75,16 @@ The creator is working from this draft script:
 ---
 
 Also assess how well this chunk matches the script and include a "script_match" field describing the alignment."""
+
+    if recording_context:
+        system_prompt += f"""
+
+Recording context (from camera metadata):
+{recording_context}
+
+Use this context to make descriptions more specific and informative when relevant
+(e.g. include location or camera in the description if it adds value).
+Do NOT force location/date into every description — only when it genuinely helps identify the clip."""
 
     user_prompt = f"""Analyze this transcript chunk (chunk #{chunk.index + 1}, duration: {chunk.duration:.1f}s):
 
@@ -120,6 +131,7 @@ def analyze_chunks(
     script: str | None = None,
     model: str = "deepseek-chat",
     client: OpenAI | None = None,
+    recording_context: str = "",
 ) -> list[ChunkInfo]:
     """Analyze all chunks and attach analysis results."""
     if client is None:
@@ -132,6 +144,7 @@ def analyze_chunks(
             script=script,
             model=model,
             client=client,
+            recording_context=recording_context,
         )
 
     return chunks

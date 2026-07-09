@@ -17,6 +17,9 @@ dependencies = [
     "openai-whisper>=20240930",
 ]
 
+[project.optional-dependencies]
+geo = ["reverse_geocoder>=1.5.1"]
+
 [project.scripts]
 video-chunker = "video_chunker.cli:cli"
 
