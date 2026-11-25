@@ -14,11 +14,14 @@ dependencies = [
     "openai>=1.0.0",
     "rich>=13.0.0",
     "python-dotenv>=1.0.0",
-    "openai-whisper>=20240930",
 ]
 
 [project.optional-dependencies]
+# Python Whisper on the CPU (--whisper-mode local). The default engine is whisper.cpp
+# (brew install whisper-cpp), which needs no Python packages and no PyTorch.
+local-whisper = ["openai-whisper>=20240930"]
 geo = ["reverse_geocoder>=1.5.1"]
+dev = ["pytest>=8"]
 
 [project.scripts]
 video-chunker = "video_chunker.cli:cli"

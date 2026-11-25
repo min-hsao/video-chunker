@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
 from openai import OpenAI
+
+from .grounding import UNTRUSTED_NOTE, find_segment_with_quote, normalise, quote_matches
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,7 @@ def analyze_chunk(
     model: str = "deepseek-chat",
     client: OpenAI | None = None,
     recording_context: str = "",
+    names_line: str = "",
 ) -> ChunkAnalysis:
     """Analyze a chunk transcript using an LLM to determine completeness and description."""
     if client is None:
@@ -85,6 +89,10 @@ Recording context (from camera metadata):
 Use this context to make descriptions more specific and informative when relevant
 (e.g. include location or camera in the description if it adds value).
 Do NOT force location/date into every description — only when it genuinely helps identify the clip."""
+
+    if names_line:
+        system_prompt += f"\n\n{names_line}"
+    system_prompt += f"\n\n{UNTRUSTED_NOTE}"
 
     user_prompt = f"""Analyze this transcript chunk (chunk #{chunk.index + 1}, duration: {chunk.duration:.1f}s):
 
@@ -132,6 +140,7 @@ def analyze_chunks(
     model: str = "deepseek-chat",
     client: OpenAI | None = None,
     recording_context: str = "",
+    names_line: str = "",
 ) -> list[ChunkInfo]:
     """Analyze all chunks and attach analysis results."""
     if client is None:
@@ -145,12 +154,57 @@ def analyze_chunks(
             model=model,
             client=client,
             recording_context=recording_context,
+            names_line=names_line,
         )
 
     return chunks
 
 
 # ── Smart AI features ────────────────────────────────────────────────────────
+#
+# Every request numbers its items with a batch-local "id" and every answer is looked up by
+# that id (earlier versions mixed absolute and batch-relative indexes, so after the first
+# batch decisions landed on the wrong segments). Decisions that remove footage must quote
+# the words they are about; grounding.quote_matches checks the quote against the segment
+# and drops the decision if it is not there.
+
+
+def _chat_json(client: OpenAI, model: str, system_prompt: str, user_prompt: str) -> dict:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+    )
+    return json.loads(response.choices[0].message.content or "{}")
+
+
+def _by_id(items: list, key: str = "decisions") -> dict[int, dict]:
+    out: dict[int, dict] = {}
+    for d in items or []:
+        if not isinstance(d, dict):
+            continue
+        raw = d.get("id", d.get("index"))
+        try:
+            out[int(raw)] = d
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _system(prompt: str, names_line: str = "") -> str:
+    extra = f"\n\n{names_line}" if names_line else ""
+    return f"{prompt}\n\n{UNTRUSTED_NOTE}{extra}"
+
+
+def _to_float(value, default: float = 0.5) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _get_transcript_window(
@@ -199,13 +253,12 @@ def validate_split_points(
     model: str = "deepseek-chat",
     client: OpenAI | None = None,
     batch_size: int = 15,
+    names_line: str = "",
 ) -> list[SplitValidation]:
     """Use LLM to validate candidate split points.
 
     For each silence, asks the LLM whether it's a natural topic boundary
-    (good split) or a mid-thought pause (bad split).
-
-    Batches multiple candidates per API call to reduce costs.
+    (good split) or a mid-thought pause (bad split). Unanswered candidates are kept.
     """
     if not candidate_times:
         return []
@@ -213,23 +266,7 @@ def validate_split_points(
         client = OpenAI()
 
     results: list[SplitValidation] = []
-
-    # Process in batches
-    for batch_start in range(0, len(candidate_times), batch_size):
-        batch = candidate_times[batch_start:batch_start + batch_size]
-
-        # Build context for each candidate
-        candidates_info: list[dict] = []
-        for i, t in enumerate(batch):
-            before, after = _get_transcript_window(transcript_text, segments, t)
-            candidates_info.append({
-                "index": i,
-                "timestamp": round(t, 1),
-                "text_before": before[-500:],  # Cap context length
-                "text_after": after[:500],
-            })
-
-        system_prompt = """You are a video editor deciding where to split a long recording into clips.
+    system_prompt = _system("""You are a video editor deciding where to split a long recording into clips.
 
 For each candidate split point, you see transcript text BEFORE and AFTER the proposed cut.
 Decide whether this is a GOOD or BAD place to split.
@@ -237,56 +274,42 @@ Decide whether this is a GOOD or BAD place to split.
 GOOD splits: topic changes, completed thoughts, natural paragraph breaks.
 BAD splits: mid-sentence pauses, speaker thinking mid-idea, brief hesitation in flow.
 
-Respond in JSON format only:
-{
-    "decisions": [
-        {
-            "index": 0,
-            "approved": true,
-            "reason": "Brief explanation",
-            "confidence": 0.9
-        },
-        ...
-    ]
-}"""
+Answer every candidate, using its "id". Respond in JSON only:
+{"decisions": [{"id": 0, "approved": true, "reason": "brief explanation", "confidence": 0.9}]}""", names_line)
 
-        user_prompt = f"""Evaluate these {len(batch)} candidate split points:
-
-{json.dumps(candidates_info, indent=2)}"""
+    for batch_start in range(0, len(candidate_times), batch_size):
+        batch = candidate_times[batch_start:batch_start + batch_size]
+        candidates_info = []
+        for k, t in enumerate(batch):
+            before, after = _get_transcript_window(transcript_text, segments, t)
+            candidates_info.append({
+                "id": k,
+                "timestamp": round(t, 1),
+                "text_before": before[-500:],
+                "text_after": after[:500],
+            })
 
         logger.info("Validating %d split points with LLM (batch %d-%d)",
-                     len(batch), batch_start, batch_start + len(batch))
-
+                    len(batch), batch_start, batch_start + len(batch))
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-            )
-            content = response.choices[0].message.content or "{}"
-            data = json.loads(content)
-            decisions = {d["index"]: d for d in data.get("decisions", [])}
+            data = _chat_json(client, model, system_prompt,
+                              f"Evaluate these {len(batch)} candidate split points:\n\n"
+                              + json.dumps(candidates_info, indent=2, ensure_ascii=False))
+            decisions = _by_id(data.get("decisions"))
         except Exception as e:
             logger.warning("LLM split validation failed: %s — keeping all candidates", e)
-            # On failure, keep all candidates (safe fallback)
-            for t in batch:
-                results.append(SplitValidation(
-                    timestamp=t, approved=True,
-                    reason=f"LLM unavailable: {e}", confidence=0.5,
-                ))
-            continue
+            decisions = {}
 
-        for i, t in enumerate(batch):
-            dec = decisions.get(i, {})
+        for k, t in enumerate(batch):
+            dec = decisions.get(k)
+            if dec is None:
+                results.append(SplitValidation(t, True, "no answer — kept", 0.5))
+                continue
             results.append(SplitValidation(
                 timestamp=t,
                 approved=bool(dec.get("approved", True)),
-                reason=str(dec.get("reason", "no response")),
-                confidence=float(dec.get("confidence", 0.5)),
+                reason=str(dec.get("reason", "")),
+                confidence=_to_float(dec.get("confidence")),
             ))
 
     approved = sum(1 for r in results if r.approved)
@@ -296,11 +319,19 @@ Respond in JSON format only:
 
 @dataclass
 class RetakeDetection:
-    """LLM verdict on whether a segment is a retake/restart."""
+    """LLM verdict on whether a segment is a retake of the one before it.
+
+    ``timestamp`` is where the new attempt starts (a split point in chunk mode);
+    ``prev_start``/``prev_end`` is the abandoned attempt (what clean mode removes).
+    """
     timestamp: float
     is_retake: bool
     reason: str
     confidence: float
+    prev_start: float = 0.0
+    prev_end: float = 0.0
+    quote: str = ""
+    grounded: bool = False
 
 
 def detect_retakes_llm(
@@ -309,130 +340,107 @@ def detect_retakes_llm(
     model: str = "deepseek-chat",
     client: OpenAI | None = None,
     batch_size: int = 20,
+    names_line: str = "",
 ) -> list[RetakeDetection]:
     """Use LLM to detect retakes that string similarity misses.
 
-    Catches:
-    - Verbal cues ("let me try that again", "one more time")
-    - Same idea with different words
-    - Abandoned mid-thought segments
+    Catches verbal cues ("let me try that again"), the same idea in different words,
+    and abandoned mid-thought segments. A retake counts only when the model quotes words
+    that really are in the earlier (abandoned) segment.
     """
     if len(segments) < 2:
         return []
     if client is None:
         client = OpenAI()
 
-    results: list[RetakeDetection] = []
-
-    # Build pairs of consecutive segments for batch evaluation
-    pairs: list[dict] = []
+    pairs: list[tuple[object, object]] = []
     for i in range(1, len(segments)):
-        prev = segments[i - 1]
-        curr = segments[i]
-        # Only check within 60s window
-        if curr.start - prev.start > 60.0:
-            continue
-        pairs.append({
-            "index": i,
-            "timestamp": round(curr.start, 1),
-            "prev_segment": {
-                "text": prev.text,
-                "start": round(prev.start, 1),
-                "end": round(prev.end, 1),
-            },
-            "curr_segment": {
-                "text": curr.text,
-                "start": round(curr.start, 1),
-                "end": round(curr.end, 1),
-            },
-        })
-
+        prev, curr = segments[i - 1], segments[i]
+        if curr.start - prev.start <= 60.0:
+            pairs.append((prev, curr))
     if not pairs:
         return []
 
-    for batch_start in range(0, len(pairs), batch_size):
-        batch = pairs[batch_start:batch_start + batch_size]
+    system_prompt = _system("""You are a video editor detecting retakes in a recording session.
 
-        system_prompt = """You are a video editor detecting retakes in a recording session.
-
-For each pair of consecutive transcript segments, decide if the second segment is a RETAKE
-of the first. A retake means the speaker is restarting, redoing, or re-attempting what
-they just said.
+For each pair of consecutive transcript segments, decide if the SECOND segment is a RETAKE
+of the FIRST: the speaker is restarting, redoing or re-attempting what they just said, so
+the first segment is the abandoned attempt.
 
 Signs of a retake:
 - Verbal cues: "let me try again", "one more time", "starting over", "let me redo that"
-- The second segment covers the same topic/idea as the first (even with different words)
-- The first segment appears abandoned mid-thought (incomplete sentence)
-- The second segment starts the same topic but more clearly/confidently
+- The second segment covers the same idea as the first (even in different words)
+- The first segment is abandoned mid-thought
+- The second segment starts the same topic more clearly
 
-NOT a retake:
-- Continuing the same thought
-- Natural follow-up or next point
-- Answering a different question
+NOT a retake: continuing the thought, the next point, answering a different question.
 
-Respond in JSON format only:
-{
-    "decisions": [
-        {
-            "index": 0,
-            "is_retake": false,
-            "reason": "Brief explanation",
-            "confidence": 0.9
-        }
-    ]
-}"""
+For every retake, "quote" must be words copied exactly from the FIRST segment (the
+abandoned attempt). Answer every pair, using its "id". Respond in JSON only:
+{"decisions": [{"id": 0, "is_retake": true, "quote": "words from the first segment", "reason": "brief", "confidence": 0.9}]}""", names_line)
 
-        user_prompt = f"""Evaluate these {len(batch)} segment pairs for retakes:
-
-{json.dumps(batch, indent=2)}"""
-
+    results: list[RetakeDetection] = []
+    for batch_start in range(0, len(pairs), batch_size):
+        batch = pairs[batch_start:batch_start + batch_size]
+        payload = [
+            {
+                "id": k,
+                "first_segment": {"text": prev.text, "start": round(prev.start, 1), "end": round(prev.end, 1)},
+                "second_segment": {"text": curr.text, "start": round(curr.start, 1), "end": round(curr.end, 1)},
+            }
+            for k, (prev, curr) in enumerate(batch)
+        ]
         logger.info("Detecting retakes via LLM: %d pairs (batch %d-%d)",
-                     len(batch), batch_start, batch_start + len(batch))
-
+                    len(batch), batch_start, batch_start + len(batch))
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-            )
-            content = response.choices[0].message.content or "{}"
-            data = json.loads(content)
-            decisions = {d["index"]: d for d in data.get("decisions", [])}
+            data = _chat_json(client, model, system_prompt,
+                              f"Evaluate these {len(batch)} segment pairs for retakes:\n\n"
+                              + json.dumps(payload, indent=2, ensure_ascii=False))
+            decisions = _by_id(data.get("decisions"))
         except Exception as e:
             logger.warning("LLM retake detection failed: %s", e)
             continue
 
-        for pair in batch:
-            i = pair["index"]
-            dec = decisions.get(i - pairs[0]["index"], {})
-            # decisions indexed relative to batch
-            batch_idx = i - pairs[0]["index"]
-            dec = decisions.get(batch_idx, {})
+        for k, (prev, curr) in enumerate(batch):
+            dec = decisions.get(k, {})
+            is_retake = bool(dec.get("is_retake", False))
+            quote = str(dec.get("quote", "") or "")
+            reason = str(dec.get("reason", "no answer"))
+            grounded = is_retake and quote_matches(quote, prev.text)
+            if is_retake and not grounded:
+                logger.info("Retake at %.1fs dropped: quote %r is not in the earlier segment", curr.start, quote)
+                reason = f"dropped (quote not in transcript): {reason}"
             results.append(RetakeDetection(
-                timestamp=pair["timestamp"],
-                is_retake=bool(dec.get("is_retake", False)),
-                reason=str(dec.get("reason", "no response")),
-                confidence=float(dec.get("confidence", 0.5)),
+                timestamp=curr.start,
+                is_retake=grounded,
+                reason=reason,
+                confidence=_to_float(dec.get("confidence")),
+                prev_start=prev.start,
+                prev_end=prev.end,
+                quote=quote,
+                grounded=grounded,
             ))
 
-    retake_count = sum(1 for r in results if r.is_retake)
-    logger.info("LLM retake detection: %d/%d segments identified as retakes",
-                 retake_count, len(results))
+    logger.info("LLM retake detection: %d/%d pairs are grounded retakes",
+                sum(1 for r in results if r.is_retake), len(results))
     return results
 
 
 @dataclass
 class FillerDetection:
-    """LLM verdict on whether a segment contains filler vs meaningful speech."""
+    """LLM verdict on filler speech.
+
+    ``start``/``end`` is the time to remove: just the quoted filler words when word
+    timings locate them, otherwise the whole segment, and only when the whole segment
+    is the filler.
+    """
     start: float
     end: float
     is_filler: bool
     reason: str
     confidence: float
+    quote: str = ""
+    grounded: bool = False
 
 
 # Potential filler words/phrases to flag for LLM review
@@ -444,119 +452,112 @@ _POTENTIAL_FILLERS = {
 }
 
 
+def locate_quote_span(quote: str, words: list | None, start: float, end: float) -> tuple[float, float] | None:
+    """Time span of the words that spell ``quote`` inside [start, end], or None."""
+    target = normalise(quote)
+    if not target or not words:
+        return None
+    inside = [w for w in words if w.end > start - 0.25 and w.start < end + 0.25]
+    norm = [normalise(w.word) for w in inside]
+    for i in range(len(inside)):
+        acc = ""
+        for j in range(i, len(inside)):
+            acc += norm[j]
+            if acc == target:
+                return inside[i].start, inside[j].end
+            if not target.startswith(acc):
+                break
+    return None
+
+
 def detect_fillers_llm(
     segments: list,
     *,
     model: str = "deepseek-chat",
     client: OpenAI | None = None,
     batch_size: int = 25,
+    words: list | None = None,
+    names_line: str = "",
 ) -> list[FillerDetection]:
-    """Use LLM to intelligently detect filler words in context.
+    """Use LLM to detect filler words in context.
 
-    Unlike the hardcoded list, this understands that "you know" is filler
-    in "you know, like, whatever" but NOT in "you know the thing about AI is..."
+    Unlike the hardcoded list, this understands that "you know" is filler in
+    "you know, like, whatever" but not in "you know the thing about AI is...".
+    Only the quoted filler is removed (located with word timings); without word
+    timings a segment is removed only when it is nothing but the filler.
     """
     if not segments:
         return []
     if client is None:
         client = OpenAI()
 
-    # Pre-filter: only send segments that contain potential filler words
-    candidates: list[dict] = []
-    for i, seg in enumerate(segments):
+    candidates = []
+    for seg in segments:
         text_lower = seg.text.lower().strip().rstrip(".,!?;:")
-        # Check if any potential filler appears in this segment
-        has_potential = any(
-            f in text_lower
-            for f in _POTENTIAL_FILLERS
-        )
-        # Also check very short segments (single word = likely filler)
         word_count = len(text_lower.split())
-        if has_potential or word_count <= 2:
-            candidates.append({
-                "index": i,
-                "start": round(seg.start, 2),
-                "end": round(seg.end, 2),
-                "text": seg.text,
-                "word_count": word_count,
-            })
-
+        if word_count <= 2 or any(re.search(rf"(?<!\w){re.escape(f.lower())}(?!\w)", text_lower) for f in _POTENTIAL_FILLERS):
+            candidates.append(seg)
     if not candidates:
         return []
 
-    results: list[FillerDetection] = []
+    system_prompt = _system("""You are a video editor identifying filler words and phrases in speech transcripts.
 
+For each segment decide whether it contains FILLER (a meaningless verbal tic) that can be
+removed without changing the meaning.
+
+FILLER: "um" / "uh" on their own; "you know" or "like" as a tic ("it was like, you know,
+like really good"); "I mean" as an empty bridge; "basically" / "literally" / "actually"
+adding nothing.
+MEANINGFUL (not filler): "you know the thing about AI is..."; "I like that approach";
+"I mean what I say"; "actually, that's correct" (a real correction).
+
+For each filler, "quote" must be the filler words copied exactly from the segment, and only
+those words (for example "um, you know"). Answer every segment, using its "id". JSON only:
+{"decisions": [{"id": 0, "is_filler": true, "quote": "um", "reason": "brief", "confidence": 0.9}]}""", names_line)
+
+    results: list[FillerDetection] = []
     for batch_start in range(0, len(candidates), batch_size):
         batch = candidates[batch_start:batch_start + batch_size]
-
-        system_prompt = """You are a video editor identifying filler words and phrases in speech transcripts.
-
-For each segment, decide if it is FILLER (meaningless verbal tic) or MEANINGFUL (part of the content).
-
-Examples of FILLER:
-- "um" standing alone
-- "you know" as a verbal tic ("um, you know, like...")
-- "like" used as filler ("it was like, you know, like really good")
-- "I mean" as a bridge with no content
-- "basically" / "literally" / "actually" when adding no information
-
-Examples of MEANINGFUL (NOT filler):
-- "you know the thing about AI is..." ("you know" introduces a topic)
-- "I like that approach" ("like" is a verb)
-- "I mean what I say" (literal use)
-- "actually, that's correct" (adds correction/emphasis with substance)
-- Short but content-bearing words in context
-
-Respond in JSON format only:
-{
-    "decisions": [
-        {
-            "index": 0,
-            "is_filler": true,
-            "reason": "Brief explanation",
-            "confidence": 0.9
-        }
-    ]
-}"""
-
-        user_prompt = f"""Evaluate these {len(batch)} segments for filler vs meaningful speech:
-
-{json.dumps(batch, indent=2)}"""
-
+        payload = [
+            {"id": k, "start": round(s.start, 2), "end": round(s.end, 2), "text": s.text}
+            for k, s in enumerate(batch)
+        ]
         logger.info("Detecting fillers via LLM: %d segments (batch %d-%d)",
-                     len(batch), batch_start, batch_start + len(batch))
-
+                    len(batch), batch_start, batch_start + len(batch))
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-            )
-            content = response.choices[0].message.content or "{}"
-            data = json.loads(content)
-            decisions = {d["index"]: d for d in data.get("decisions", [])}
+            data = _chat_json(client, model, system_prompt,
+                              f"Evaluate these {len(batch)} segments for filler:\n\n"
+                              + json.dumps(payload, indent=2, ensure_ascii=False))
+            decisions = _by_id(data.get("decisions"))
         except Exception as e:
             logger.warning("LLM filler detection failed: %s", e)
             continue
 
-        for cand in batch:
-            batch_idx = cand["index"] - batch[0]["index"]
-            dec = decisions.get(batch_idx, {})
+        for k, seg in enumerate(batch):
+            dec = decisions.get(k, {})
+            is_filler = bool(dec.get("is_filler", False))
+            quote = str(dec.get("quote", "") or "")
+            reason = str(dec.get("reason", "no answer"))
+            span: tuple[float, float] | None = None
+            if is_filler and quote_matches(quote, seg.text):
+                span = locate_quote_span(quote, words, seg.start, seg.end)
+                if span is None and normalise(quote) == normalise(seg.text):
+                    span = (seg.start, seg.end)  # the whole segment is the filler
+            if is_filler and span is None:
+                logger.info("Filler at %.1fs dropped: quote %r not located in %r", seg.start, quote, seg.text)
+                reason = f"dropped (quote not located): {reason}"
             results.append(FillerDetection(
-                start=cand["start"],
-                end=cand["end"],
-                is_filler=bool(dec.get("is_filler", False)),
-                reason=str(dec.get("reason", "no response")),
-                confidence=float(dec.get("confidence", 0.5)),
+                start=span[0] if span else seg.start,
+                end=span[1] if span else seg.end,
+                is_filler=span is not None,
+                reason=reason,
+                confidence=_to_float(dec.get("confidence")),
+                quote=quote,
+                grounded=span is not None,
             ))
 
-    filler_count = sum(1 for r in results if r.is_filler)
-    logger.info("LLM filler detection: %d/%d segments identified as filler",
-                 filler_count, len(results))
+    logger.info("LLM filler detection: %d/%d segments have grounded filler",
+                sum(1 for r in results if r.is_filler), len(results))
     return results
 
 
@@ -565,8 +566,9 @@ class ContentCutSuggestion:
     """LLM suggestion for content to cut in clean mode."""
     start: float
     end: float
-    reason: str  # "tangent", "redundant", "filler_pause", "off_topic"
+    reason: str  # "tangent", "redundant", "thinking_aloud", "off_topic"
     confidence: float
+    quote: str = ""
 
 
 def suggest_content_cuts(
@@ -574,113 +576,78 @@ def suggest_content_cuts(
     *,
     model: str = "deepseek-chat",
     client: OpenAI | None = None,
+    names_line: str = "",
 ) -> list[ContentCutSuggestion]:
-    """Use LLM to identify content that should be cut in clean mode.
+    """Use LLM to identify whole segments to cut in clean mode.
 
-    Detects:
-    - Tangents and off-topic rants
-    - Redundant repetitions (same thing said multiple times)
-    - Long thinking pauses that aren't dramatic pauses
-    - Off-topic chatter between takes
+    Detects tangents, redundant repetition, thinking aloud and off-topic chatter.
+    Each cut must quote its segment; a quote found under a different segment (8+ letters)
+    is re-pointed there, otherwise the cut is dropped.
     """
     if not segments:
         return []
     if client is None:
         client = OpenAI()
 
-    # Build a timeline of all segments
-    timeline: list[dict] = []
-    for i, seg in enumerate(segments):
-        timeline.append({
-            "index": i,
-            "start": round(seg.start, 1),
-            "end": round(seg.end, 1),
-            "text": seg.text,
-        })
-
-    # If too many segments, split into overlapping windows
-    window_size = 40
-    all_suggestions: list[ContentCutSuggestion] = []
-
-    for win_start in range(0, len(timeline), window_size // 2):
-        window = timeline[win_start:win_start + window_size]
-        if len(window) < 3:
-            continue
-
-        system_prompt = """You are editing a video recording to create a clean, polished final cut.
+    system_prompt = _system("""You are editing a video recording into a clean, polished final cut.
 
 Review the transcript segments and identify any that should be REMOVED:
-- Tangents: speaker goes off on an unrelated tangent before returning to topic
-- Redundant: speaker repeats the same point they already made (not a retake, just repetitive)
-- Off-topic chatter: casual talk, side comments, setup chatter not part of the content
-- Thinking aloud: verbalized thinking that doesn't add value ("hmm, let me think about that...")
+- Tangents: an unrelated detour before returning to the topic
+- Redundant: repeats a point already made (not a retake, just repetitive)
+- Off-topic chatter: casual talk, side comments, setup chatter
+- Thinking aloud: verbalised thinking that adds nothing
 
-Do NOT cut:
-- Core content, explanations, demonstrations
-- Natural transitions between topics
-- Brief pauses or normal speech flow
-- Humor or personality that adds to the video
+Do NOT cut core content, explanations, demonstrations, natural transitions, normal pauses,
+or humour and personality that add to the video.
 
-Respond in JSON format only:
-{
-    "cuts": [
-        {
-            "index": 5,
-            "reason": "tangent|redundant|off_topic|thinking_aloud",
-            "confidence": 0.9,
-            "explanation": "Brief explanation"
-        }
-    ]
-}
+For each cut, "quote" must be words copied exactly from that segment. JSON only:
+{"cuts": [{"id": 5, "reason": "tangent|redundant|off_topic|thinking_aloud", "quote": "words from the segment", "confidence": 0.9}]}
+If nothing should be cut, return {"cuts": []}""", names_line)
 
-If nothing should be cut, return {"cuts": []}"""
-
-        user_prompt = f"""Review these transcript segments for cutting:
-
-{json.dumps(window, indent=2)}"""
-
+    window_size = 40
+    suggestions: list[ContentCutSuggestion] = []
+    for win_start in range(0, len(segments), window_size // 2):
+        window = segments[win_start:win_start + window_size]
+        if len(window) < 3:
+            continue
+        payload = [
+            {"id": k, "start": round(s.start, 1), "end": round(s.end, 1), "text": s.text}
+            for k, s in enumerate(window)
+        ]
         logger.info("LLM content review: %d segments (window %d-%d)",
-                     len(window), win_start, win_start + len(window))
-
+                    len(window), win_start, win_start + len(window))
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-            )
-            content = response.choices[0].message.content or "{}"
-            data = json.loads(content)
+            data = _chat_json(client, model, system_prompt,
+                              "Review these transcript segments for cutting:\n\n"
+                              + json.dumps(payload, indent=2, ensure_ascii=False))
         except Exception as e:
             logger.warning("LLM content cut suggestion failed: %s", e)
             continue
 
-        for cut in data.get("cuts", []):
-            idx = cut.get("index")
-            if idx is None or idx < 0 or idx >= len(window):
-                continue
-            actual_idx = win_start + idx
-            if actual_idx >= len(segments):
-                continue
-            seg = segments[actual_idx]
-            all_suggestions.append(ContentCutSuggestion(
+        for k, cut in _by_id(data.get("cuts")).items():
+            quote = str(cut.get("quote", "") or "")
+            seg = window[k] if 0 <= k < len(window) else None
+            if seg is None or not quote_matches(quote, seg.text):
+                moved = find_segment_with_quote(quote, window)
+                if moved is None:
+                    logger.info("Content cut dropped: quote %r not found", quote)
+                    continue
+                seg = window[moved]
+            suggestions.append(ContentCutSuggestion(
                 start=seg.start,
                 end=seg.end,
                 reason=str(cut.get("reason", "unspecified")),
-                confidence=float(cut.get("confidence", 0.5)),
+                confidence=_to_float(cut.get("confidence")),
+                quote=quote,
             ))
 
-    # Deduplicate overlapping suggestions
     seen: set[tuple[float, float]] = set()
     deduped: list[ContentCutSuggestion] = []
-    for s in all_suggestions:
+    for s in suggestions:
         key = (round(s.start, 1), round(s.end, 1))
         if key not in seen:
             seen.add(key)
             deduped.append(s)
 
-    logger.info("LLM content review: %d cut suggestions", len(deduped))
+    logger.info("LLM content review: %d grounded cut suggestions", len(deduped))
     return deduped

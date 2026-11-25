@@ -1,0 +1,131 @@
+{
+ "_about": "Shared cases for the vocabulary rules. Corrections are whole-word (no letter, digit or underscore on either side; a CJK `from` matches inside text) and case-preserving (ALL CAPS stays caps, all lower stays lower, Capitalised gets a capital first letter; a pure case fix is applied as written).",
+ "corrections": [
+  {
+   "from": "Sahm",
+   "to": "Sam"
+  },
+  {
+   "from": "rocket doc",
+   "to": "rocketdoc"
+  },
+  {
+   "from": "sam tricks",
+   "to": "Samtrix"
+  },
+  {
+   "from": "dayna",
+   "to": "Dana"
+  },
+  {
+   "from": "王小鳴",
+   "to": "王小明"
+  }
+ ],
+ "apply": [
+  {
+   "in": "Sahm said hi",
+   "out": "Sam said hi"
+  },
+  {
+   "in": "SAHM and sahm",
+   "out": "SAM and sam"
+  },
+  {
+   "in": "Sahmsmith is Sam's handle, so is @sahmsmith",
+   "out": "Sahmsmith is Sam's handle, so is @sahmsmith"
+  },
+  {
+   "in": "Sahm's idea",
+   "out": "Sam's idea"
+  },
+  {
+   "in": "Thanks, Sahm.",
+   "out": "Thanks, Sam."
+  },
+  {
+   "in": "Minh_2 and Minh2 stay",
+   "out": "Minh_2 and Minh2 stay"
+  },
+  {
+   "in": "the rocket doc app",
+   "out": "the rocketdoc app"
+  },
+  {
+   "in": "Sam tricks is the company",
+   "out": "Samtrix is the company"
+  },
+  {
+   "in": "ask Dayna",
+   "out": "ask Dana"
+  },
+  {
+   "in": "我是王小鳴。",
+   "out": "我是王小明。"
+  },
+  {
+   "in": "",
+   "out": ""
+  },
+  {
+   "in": "nothing to change",
+   "out": "nothing to change"
+  }
+ ],
+ "keyterms": {
+  "vocabulary": {
+   "my_name": "Sam",
+   "people": [
+    "Dana",
+    "sam"
+   ],
+   "words": [
+    "Samtrix",
+    "rocketdoc"
+   ],
+   "corrections": [
+    {
+     "from": "Sahm",
+     "to": "Sam"
+    },
+    {
+     "from": "rocket doc",
+     "to": "rocketdoc"
+    }
+   ]
+  },
+  "out": [
+   "Sam",
+   "Dana",
+   "Samtrix",
+   "rocketdoc"
+  ]
+ },
+ "learn": {
+  "before": {
+   "my_name": null,
+   "aliases": [],
+   "people": [
+    "Sahm"
+   ],
+   "words": [],
+   "corrections": []
+  },
+  "from": "Sahm",
+  "to": "Sam",
+  "after": {
+   "my_name": null,
+   "aliases": [],
+   "people": [
+    "Sam"
+   ],
+   "words": [],
+   "corrections": [
+    {
+     "from": "Sahm",
+     "to": "Sam"
+    }
+   ]
+  }
+ }
+}

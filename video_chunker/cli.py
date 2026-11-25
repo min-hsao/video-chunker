@@ -26,17 +26,18 @@ from .analyzer import (
 )
 from .splitter import (
     MIN_CHUNK_DURATION, build_chunks, clean_video, compute_split_points, split_video,
-    compute_clean_segments_llm,
+    compute_clean_segments_llm, _count_cuts,
 )
 from .metadata import extract_metadata, metadata_summary
-from .transcriber import transcribe_audio
-from .transcriber import Transcript
+from .transcriber import DEFAULT_MODELS, Transcript, resolve_mode, timing_drift, transcribe_audio
+from .vocabulary import Vocabulary
 from .utils import SilenceInterval, detect_silence, get_keyframes, get_video_info, qc_file, QCResult, generate_contact_sheet
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v"}
+DRIFT_LIMIT = 0.10  # share of speech allowed inside known silences before re-transcribing
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -239,8 +240,11 @@ def _auto_tune_silence(
 @click.option("--silence-duration", type=float, default=3.0, help="Minimum silence duration in seconds to consider as a break.")
 @click.option("--silence-threshold", type=float, default=-30, help="Silence threshold in dB (default: -30).")
 @click.option("--detailed", is_flag=True, help="Output full JSON manifest.")
-@click.option("--whisper-mode", default="local", type=click.Choice(["local", "openai"], case_sensitive=False), help="Whisper mode: local (free, runs on your machine) or openai (paid API).")
-@click.option("--whisper-model", default="small", help="Whisper model: tiny/base/small/medium/large-v3 for local, or whisper-1 for openai.")
+@click.option("--whisper-mode", default="auto", type=click.Choice(["auto", "cpp", "local", "openai"], case_sensitive=False), help="Transcription engine: auto (default: cpp if whisper-cli is installed, else local), cpp (whisper.cpp on the Mac GPU, free), local (Python Whisper on the CPU, slow), or openai (paid API).")
+@click.option("--whisper-model", default=None, help="Model. cpp: large-v3-turbo (default), large-v3-turbo-q5_0, small.en… or a path to a ggml .bin; local: small (default)/medium/large-v3; openai: whisper-1.")
+@click.option("--clean-audio/--no-clean-audio", default=True, help="Clean a copy of the audio before transcribing: 80 Hz high-pass, denoise, -20 LUFS (default: on). Clips are always cut from the original.")
+@click.option("--vad/--no-vad", default=False, help="Experimental, whisper.cpp only: skip non-speech with Silero VAD (stops invented words in long silences). Uses sentence-level timings, since whisper.cpp's word timings are off with VAD (default: off).")
+@click.option("--vocab", "vocab_path", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Vocabulary JSON (names, terms, spelling corrections). Default: ~/.config/video-chunker/vocab.json if it exists.")
 @click.option("--language", default=None, help="Language code for transcription (e.g. 'en'). Auto-detect if not set.")
 @click.option("--llm-model", default="deepseek-chat", help="LLM model for chunk analysis. Use 'deepseek-chat' for DeepSeek, or 'gpt-4o' for OpenAI.")
 @click.option("--dry-run", is_flag=True, help="Show detected chunks without splitting.")
@@ -270,7 +274,10 @@ def cli(
     silence_threshold: float,
     detailed: bool,
     whisper_mode: str,
-    whisper_model: str,
+    whisper_model: str | None,
+    clean_audio: bool,
+    vad: bool,
+    vocab_path: Path | None,
     language: str | None,
     llm_model: str,
     dry_run: bool,
@@ -309,7 +316,13 @@ def cli(
         script_text = script.read_text(encoding="utf-8")
         console.print(f"[dim]Loaded script from {script}[/dim]")
 
+    vocab = Vocabulary.load(vocab_path)
+    if vocab and not vocab.is_empty():
+        console.print(f"[dim]Vocabulary: {len(vocab.keyterms())} names/terms, {len(vocab.corrections)} corrections[/dim]")
+
     # Build shared clients once (reused across batch)
+    whisper_mode = resolve_mode(whisper_mode)
+    whisper_model = whisper_model or DEFAULT_MODELS[whisper_mode]
     whisper_client = OpenAI() if whisper_mode == "openai" else None
     effective_llm_model = _resolve_llm_model(llm_model)
     llm_client = _make_llm_client(llm_model)
@@ -343,6 +356,9 @@ def cli(
                     detailed=detailed,
                     whisper_mode=whisper_mode,
                     whisper_model=whisper_model,
+                    clean_audio=clean_audio,
+                    vad=vad,
+                    vocab=vocab,
                     language=language,
                     llm_model=effective_llm_model,
                     dry_run=dry_run,
@@ -389,6 +405,9 @@ def cli(
             detailed=detailed,
             whisper_mode=whisper_mode,
             whisper_model=whisper_model,
+            clean_audio=clean_audio,
+            vad=vad,
+            vocab=vocab,
             language=language,
             llm_model=effective_llm_model,
             dry_run=dry_run,
@@ -442,9 +461,13 @@ def process_video(
     geocode: str,
     whisper_client: OpenAI | None,
     llm_client: OpenAI,
+    clean_audio: bool = True,
+    vad: bool = False,
+    vocab: Vocabulary | None = None,
 ) -> None:
     """Process a single video file end-to-end."""
     cue_keywords = [k.strip() for k in cues.split(",") if k.strip()]
+    names_line = vocab.names_line() if vocab else ""
 
     with Progress(
         SpinnerColumn(),
@@ -520,9 +543,44 @@ def process_video(
                 mode=whisper_mode,
                 language=language,
                 client=whisper_client,
+                prompt=vocab.whisper_prompt() if vocab else None,
+                clean_audio=clean_audio,
+                vad=vad,
             )
         except Exception as e:
             raise RuntimeError(f"Transcription failed: {e}") from e
+        # Cleaned audio can make Whisper's timestamps drift when pauses are near-silent.
+        # Check against the silences found in the original audio; if the cleaned
+        # transcript puts speech inside them, transcribe the original and keep the better.
+        drift = timing_drift(transcript, silence_intervals, info.duration)
+        if clean_audio and drift > DRIFT_LIMIT:
+            console.print(
+                f"[yellow]Timing check:[/yellow] {drift:.0%} of the cleaned transcript falls in silence "
+                "— re-transcribing the original audio"
+            )
+            try:
+                raw = transcribe_audio(
+                    input_video,
+                    model=whisper_model,
+                    mode=whisper_mode,
+                    language=language,
+                    client=whisper_client,
+                    prompt=vocab.whisper_prompt() if vocab else None,
+                    clean_audio=False,
+                    vad=vad,
+                )
+                raw_drift = timing_drift(raw, silence_intervals, info.duration)
+                if raw_drift < drift:
+                    transcript, drift = raw, raw_drift
+                    console.print(f"[dim]  Using the original-audio transcript ({raw_drift:.0%} in silence)[/dim]")
+                else:
+                    console.print("[dim]  Kept the cleaned transcript (the original was no better)[/dim]")
+            except Exception as e:
+                logger.warning("Re-transcription failed (%s); keeping the cleaned transcript", e)
+        elif drift > DRIFT_LIMIT:
+            console.print(f"[yellow]Timing check:[/yellow] {drift:.0%} of the transcript falls in silence — check cut points with --review")
+        if vocab:
+            vocab.apply_to_transcript(transcript)
         console.print(f"[dim]Transcript: {len(transcript.text)} chars, {len(transcript.segments)} segments[/dim]")
         if transcript.words:
             console.print(f"[dim]Word-level timestamps: {len(transcript.words)} words[/dim]")
@@ -536,6 +594,7 @@ def process_video(
             silence_intervals=silence_intervals,
             llm_client=llm_client,
             llm_model=llm_model,
+            names_line=names_line,
             smart_retakes=smart_retakes,
             smart_fillers=smart_fillers,
             smart_clean=smart_clean,
@@ -578,6 +637,7 @@ def process_video(
             transcript.segments,
             model=llm_model,
             client=llm_client,
+            names_line=names_line,
         )
         retake_times = [r.timestamp for r in retake_detections if r.is_retake]
         if retake_times:
@@ -607,6 +667,7 @@ def process_video(
             segments=transcript.segments,
             model=llm_model,
             client=llm_client,
+            names_line=names_line,
         )
         approved = [v.timestamp for v in validations if v.approved]
         rejected = [v for v in validations if not v.approved]
@@ -668,6 +729,7 @@ def process_video(
                 model=llm_model,
                 client=llm_client,
                 recording_context=recording_context,
+                names_line=names_line,
             )
         except Exception as e:
             raise RuntimeError(f"LLM analysis failed: {e}") from e
@@ -787,6 +849,7 @@ def _process_clean(
     silence_intervals: list,
     llm_client: OpenAI,
     llm_model: str,
+    names_line: str = "",
     smart_retakes: bool = False,
     smart_fillers: bool = False,
     smart_clean: bool = False,
@@ -809,6 +872,7 @@ def _process_clean(
             transcript.segments,
             model=llm_model,
             client=llm_client,
+            names_line=names_line,
         )
         retake_count = sum(1 for r in llm_retakes if r.is_retake)
         console.print(f"  [dim]  Found {retake_count} retakes[/dim]")
@@ -819,6 +883,8 @@ def _process_clean(
             transcript.segments,
             model=llm_model,
             client=llm_client,
+            words=transcript.words,
+            names_line=names_line,
         )
         filler_count = sum(1 for f in llm_fillers if f.is_filler)
         console.print(f"  [dim]  Found {filler_count} filler segments[/dim]")
@@ -829,6 +895,7 @@ def _process_clean(
             transcript.segments,
             model=llm_model,
             client=llm_client,
+            names_line=names_line,
         )
         console.print(f"  [dim]  Found {len(llm_content_cuts)} content cut suggestions[/dim]")
 
@@ -858,7 +925,7 @@ def _process_clean(
     console.print(f"  Original:  {_format_time_hms(original)} ({original:.1f}s)")
     console.print(f"  Kept:      {_format_time_hms(kept)} ({kept:.1f}s)")
     console.print(f"  Cut:       {_format_time_hms(cut)} ({cut:.1f}s / {pct:.0f}%)")
-    console.print(f"  Segments:  {len(keep)} kept, {len(keep) - 1} cuts")
+    console.print(f"  Segments:  {len(keep)} kept, {_count_cuts(keep, original)} cuts")
 
     # Show what's being cut
     if cut > 0:
@@ -889,6 +956,7 @@ def _process_clean(
             transcript,
             silence_intervals,
             output_path,
+            keep_segments=keep,
         )
         progress.update(task, completed=1, total=1)
 

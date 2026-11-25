@@ -9,7 +9,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from .analyzer import ChunkInfo
-from .transcriber import Transcript, find_sentence_boundary, get_transcript_at_time
+from .transcriber import Transcript, find_sentence_boundary
 from .utils import SilenceInterval, sanitize_filename, snap_to_keyframe, split_video_segment
 
 logger = logging.getLogger(__name__)
@@ -220,6 +220,21 @@ def compute_split_points(
     return filtered
 
 
+def transcript_between(transcript: Transcript, start: float, end: float) -> str:
+    """Text spoken in [start, end): each word (or segment) belongs to exactly one chunk.
+
+    Uses word timings when present, else segment midpoints, so a neighbouring chunk's
+    first sentence never leaks into this chunk's description.
+    """
+    if transcript.words:
+        return " ".join(
+            w.word for w in transcript.words if start <= (w.start + w.end) / 2 < end and w.word
+        )
+    return " ".join(
+        seg.text for seg in transcript.segments if start <= (seg.start + seg.end) / 2 < end
+    )
+
+
 def build_chunks(
     split_points: list[tuple[float, bool, bool]],
     transcript: Transcript,
@@ -234,9 +249,7 @@ def build_chunks(
         start = boundaries[i]
         end = boundaries[i + 1]
         duration = end - start
-        chunk_text = get_transcript_at_time(
-            transcript, (start + end) / 2, window=(end - start) / 2 + 1
-        )
+        chunk_text = transcript_between(transcript, start, end)
         is_cue, is_retake = flags[i] if i < len(flags) else (False, False)
         chunks.append(ChunkInfo(
             index=i,
@@ -305,19 +318,19 @@ def _is_filler_segment(text: str) -> bool:
     return cleaned in FILLER_PHRASES
 
 
-def _is_retake_segment(
+def _retake_of(
     seg_index: int,
     transcript: Transcript,
-) -> bool:
-    """Check if a segment is a retake of a previous segment."""
+) -> int | None:
+    """Index of the earlier segment that segment ``seg_index`` re-does, or None."""
     segments = transcript.segments
     if seg_index >= len(segments):
-        return False
+        return None
 
     current = segments[seg_index]
     current_start = _first_words(current.text, RETAKE_COMPARE_WORDS)
     if not current_start:
-        return False
+        return None
 
     for j in range(seg_index - 1, -1, -1):
         prev = segments[j]
@@ -328,9 +341,28 @@ def _is_retake_segment(
             continue
         similarity = SequenceMatcher(None, current_start, prev_start).ratio()
         if similarity >= RETAKE_SIMILARITY_THRESHOLD:
-            return True
+            return j
 
-    return False
+    return None
+
+
+def _is_retake_segment(seg_index: int, transcript: Transcript) -> bool:
+    """Check if a segment is a retake of a previous segment."""
+    return _retake_of(seg_index, transcript) is not None
+
+
+def _abandoned_take_ranges(transcript: Transcript) -> list[tuple[float, float, str]]:
+    """Time ranges of abandoned attempts: from the first try up to where the retake starts.
+
+    The latest take is kept (it is usually the good one); earlier attempts are cut.
+    """
+    ranges: list[tuple[float, float, str]] = []
+    segs = transcript.segments
+    for i in range(len(segs)):
+        j = _retake_of(i, transcript)
+        if j is not None and segs[i].start > segs[j].start:
+            ranges.append((segs[j].start, segs[i].start, "retake"))
+    return ranges
 
 
 @dataclass
@@ -369,10 +401,7 @@ def compute_clean_segments(
 
     # ── 3. Cut retakes ────────────────────────────────────────────────────
     if remove_retakes:
-        for i in range(len(transcript.segments)):
-            if _is_retake_segment(i, transcript):
-                seg = transcript.segments[i]
-                cut_ranges.append((seg.start, seg.end, "retake"))
+        cut_ranges.extend(_abandoned_take_ranges(transcript))
 
     # ── Merge overlapping cut ranges ──────────────────────────────────────
     if not cut_ranges:
@@ -417,10 +446,12 @@ def clean_video(
     *,
     min_silence_to_cut: float = 1.0,
     remove_retakes: bool = True,
+    keep_segments: list[CleanSegment] | None = None,
 ) -> dict:
     """Remove filler words, silences, and retakes from a video.
 
-    Outputs a single cleaned file with the bad parts cut out.
+    Outputs a single cleaned file with the bad parts cut out. ``keep_segments``
+    (for example from compute_clean_segments_llm) overrides the built-in rules.
 
     Returns a summary dict with stats.
     """
@@ -431,13 +462,14 @@ def clean_video(
     )
     video_duration = float(info_cmd.stdout.strip())
 
-    keep_segments = compute_clean_segments(
-        transcript,
-        silence_intervals,
-        video_duration,
-        min_silence_to_cut=min_silence_to_cut,
-        remove_retakes=remove_retakes,
-    )
+    if keep_segments is None:
+        keep_segments = compute_clean_segments(
+            transcript,
+            silence_intervals,
+            video_duration,
+            min_silence_to_cut=min_silence_to_cut,
+            remove_retakes=remove_retakes,
+        )
 
     original_duration = video_duration
     kept_duration = sum(s.end - s.start for s in keep_segments)
@@ -499,8 +531,20 @@ def clean_video(
         "clean_duration": kept_duration,
         "cut_duration": cut_duration,
         "segments_kept": len(keep_segments),
-        "cuts_made": len(keep_segments) - 1,
+        "cuts_made": _count_cuts(keep_segments, video_duration),
     }
+
+
+def _count_cuts(keep: list[CleanSegment], duration: float, tol: float = 0.05) -> int:
+    """Number of removed ranges, including any at the start or the end."""
+    if not keep:
+        return 0
+    cuts = max(len(keep) - 1, 0)
+    if keep[0].start > tol:
+        cuts += 1
+    if duration - keep[-1].end > tol:
+        cuts += 1
+    return cuts
 
 
 def compute_clean_segments_llm(
@@ -546,13 +590,14 @@ def compute_clean_segments_llm(
             from .analyzer import RetakeDetection
             for rd in llm_retakes:
                 if isinstance(rd, RetakeDetection) and rd.is_retake:
-                    cut_ranges.append((rd.timestamp, rd.timestamp + 0.1, f"retake: {rd.reason}"))
+                    # Remove the abandoned attempt (the segment before the retake).
+                    start = rd.prev_start if rd.prev_end > rd.prev_start else rd.timestamp
+                    end = min(rd.prev_end, rd.timestamp) if rd.prev_end > rd.prev_start else rd.timestamp
+                    if end > start:
+                        cut_ranges.append((start, end, f"retake: {rd.reason}"))
         else:
             # Fallback to string similarity retake detection
-            for i in range(len(transcript.segments)):
-                if _is_retake_segment(i, transcript):
-                    seg = transcript.segments[i]
-                    cut_ranges.append((seg.start, seg.end, "retake"))
+            cut_ranges.extend(_abandoned_take_ranges(transcript))
 
     # ── 4. LLM content cut suggestions ────────────────────────────────────
     if llm_content_cuts:

@@ -7,7 +7,12 @@ Designed for creators who record multiple takes in a single session — product 
 ## Features
 
 - **Silence-based splitting** — uses ffmpeg `silencedetect` to find natural breaks
-- **Transcript-aware** — validates split points against OpenAI Whisper transcription so cuts never land mid-sentence
+- **Transcript-aware** — validates split points against a Whisper transcript so cuts never land mid-sentence
+- **Fast Mac transcription** — whisper.cpp on the Apple GPU (`large-v3-turbo` by default) with accurate word timings (DTW); no PyTorch needed
+- **Cleaner audio for transcription** — a copy of the audio is high-passed, gently denoised and normalised to −20 LUFS before Whisper hears it; clips are still cut losslessly from the original
+- **Timing check** — word times are checked against the silences found in the original audio; if the cleaned transcript drifts, the original audio is transcribed and the better one kept
+- **Vocabulary** — your names, terms and spelling fixes (`Sahm` → `Sam`) steer Whisper, correct the transcript and keep clip names spelled right 
+- **Grounded AI cuts** — every AI retake, filler or content cut must quote words that are really in the transcript, or it is dropped
 - **Verbal cue detection** — configurable keywords (e.g. "cut", "next") that force a split
 - **AI analysis** — each chunk is analyzed by an LLM for completeness, content description, and optional script comparison
 - **Lossless output** — splits use `-c copy` (stream copy) cutting on the nearest keyframe — no re-encoding
@@ -23,7 +28,8 @@ Designed for creators who record multiple takes in a single session — product 
 
 - Python 3.10+
 - [ffmpeg](https://ffmpeg.org/) and ffprobe installed and on your PATH
-- For local Whisper mode: None required (runs on your machine)
+- For the default engine: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`brew install whisper-cpp`). The model (`large-v3-turbo`, about 1.6 GB) downloads to `~/.cache/video-chunker/models/` on first use
+- For `--whisper-mode local` (Python Whisper on the CPU, slow): `pip install 'video-chunker[local-whisper]'` (installs PyTorch)
 - For OpenAI Whisper mode: An [OpenAI API key](https://platform.openai.com/api-keys) set as `OPENAI_API_KEY`
 - For LLM analysis (optional): `DEEPSEEK_API_KEY` for DeepSeek models, or `OPENAI_API_KEY` for GPT-4o
 - For exiftool enrichment (optional): [exiftool](https://exiftool.org/) installed and on your PATH — auto-detected if available
@@ -39,8 +45,11 @@ cd video-chunker
 # Install in a virtual environment
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e .          # add '.[dev]' for pytest
+brew install whisper-cpp  # the default transcription engine
 ```
+
+Run the tests with `pytest`.
 
 Or install dependencies directly:
 
@@ -91,13 +100,48 @@ Shows detected chunks and analysis in a table without writing any files.
 
 ### Choose models
 
-**Local Whisper (default, free):**
+**whisper.cpp (default when `whisper-cli` is installed, free, Mac GPU):**
 
 ```bash
-video-chunker recording.mp4 --whisper-model base
+video-chunker recording.mp4                                    # large-v3-turbo
+video-chunker recording.mp4 --whisper-model large-v3-turbo-q5_0  # smaller download (~550 MB)
+video-chunker recording.mp4 --whisper-model ~/models/ggml-small.en.bin
 ```
 
-Available models: `tiny` (fastest, less accurate), `base` (default, good balance), `small`, `medium`, `large-v3` (most accurate, slower).
+Any [whisper.cpp model name](https://huggingface.co/ggerganov/whisper.cpp) works, or a path to a `.bin`.
+Word timings use whisper.cpp's DTW alignment for the standard models. `--vad` (experimental)
+skips non-speech with Silero VAD; it uses sentence-level timings because whisper.cpp leaves
+word times in VAD-compressed time.
+
+**Python Whisper on the CPU (`--whisper-mode local`):**
+
+```bash
+pip install 'video-chunker[local-whisper]'
+video-chunker recording.mp4 --whisper-mode local --whisper-model small
+```
+
+Available models: `tiny`, `base`, `small` (default), `medium`, `large-v3`. Slow on long recordings (Apple's GPU path returns empty transcripts, so it runs on the CPU).
+
+**Audio cleanup:** on by default (`--no-clean-audio` to turn it off). It only changes what Whisper hears.
+
+### Vocabulary: names, terms and spelling fixes
+
+Create `~/.config/video-chunker/vocab.json` (used automatically) or pass `--vocab FILE`:
+
+```json
+{
+  "my_name": "Sam",
+  "aliases": ["Samantha"],
+  "people": ["Dana"],
+  "words": ["Samtrix", "rocketdoc"],
+  "corrections": [{"from": "Sahm", "to": "Sam"}, {"from": "sam tricks", "to": "Samtrix"}]
+}
+```
+
+The names and terms go into Whisper's prompt and the AI prompts; corrections are applied to the
+transcript before anything else sees it. Corrections are whole-word, keep the original
+capitalisation (`SAHM` → `SAM`, `sahm` → `sam`), longest first, one pass (test cases in
+`tests/data/vocabulary-cases.json`).
 
 **OpenAI Whisper API (paid, faster for long videos):**
 
@@ -129,8 +173,11 @@ Options:
   --silence-duration FLOAT    Minimum silence duration in seconds (default: 2.0)
   --silence-threshold FLOAT   Silence threshold in dB (default: -35)
   --detailed                  Output full JSON manifest
-  --whisper-mode [local|openai] Whisper mode: local (free, runs on your machine) or openai (paid API) (default: local)
-  --whisper-model TEXT        Whisper model: tiny/base/small/medium/large-v3 (local) or whisper-1/whisper-large-v3 (openai) (default: base)
+  --whisper-mode [auto|cpp|local|openai]  Engine (default: auto = cpp if whisper-cli is installed, else local)
+  --whisper-model TEXT        cpp: large-v3-turbo (default) or a .bin path; local: small; openai: whisper-1
+  --clean-audio/--no-clean-audio  Clean the transcription copy of the audio (default: on)
+  --vad/--no-vad              Experimental, cpp only: Silero VAD (default: off)
+  --vocab FILE                Vocabulary JSON (default: ~/.config/video-chunker/vocab.json if present)
   --llm-model TEXT            LLM model for analysis (default: deepseek-chat)
   --dry-run                   Show detected chunks without splitting
   --metadata/--no-metadata     Extract embedded camera/GPS metadata (default: on)
@@ -223,7 +270,7 @@ When `--detailed` is passed, a full manifest is printed with per-chunk data:
 
 1. **Probe** — `ffprobe` reads codec, resolution, duration, and fps
 2. **Silence detection** — `ffmpeg silencedetect` finds gaps exceeding the threshold
-3. **Transcription** — audio is transcribed using local Whisper (default) or OpenAI Whisper API
+3. **Transcription** — a cleaned copy of the audio is transcribed with whisper.cpp (default), Python Whisper or the OpenAI API, biased toward your vocabulary; word times are checked against the detected silences and corrections applied
 4. **Split point refinement** — silence midpoints are adjusted to nearest sentence boundaries; verbal cue keywords force additional splits
 5. **Keyframe snapping** — split points are snapped to the nearest video keyframe for clean cuts
 6. **LLM analysis** — each chunk's transcript is sent to DeepSeek or OpenAI to determine completeness and generate a brief description

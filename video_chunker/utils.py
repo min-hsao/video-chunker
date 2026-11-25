@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import tempfile
@@ -103,21 +104,37 @@ def get_video_info(video_path: Path) -> VideoInfo:
     )
 
 
-def extract_audio(video_path: Path, output_path: Path | None = None) -> Path:
-    """Extract audio from a video file as WAV (16kHz mono for Whisper)."""
-    if output_path is None:
-        output_path = Path(tempfile.mktemp(suffix=".wav"))
+# Speech cleanup for the transcription copy only (done with ffmpeg): high-pass 80 Hz (rumble, handling noise, mains hum), a gentle FFT denoise, then
+# loudness normalised to -20 LUFS with a -1 dB peak ceiling. Quiet or noisy recordings are
+# what make Whisper mishear and invent words; the source video and the clips are never touched.
+#
+# Keep the denoise gentle (no noise tracking): an aggressive denoise (afftdn tn=1) turns the
+# room tone in pauses into near-digital silence, and whisper.cpp then squeezes the pauses out
+# of its timestamps (measured: a sentence at 6.5 s reported at 3.0 s). With nr=10 and no
+# tracking, timings stayed within 0.1 s and the words were still recovered.
+SPEECH_CLEAN_FILTER = (
+    "highpass=f=80:poles=2,highpass=f=80:poles=2,highpass=f=80:poles=2,"
+    "afftdn=nf=-25:nr=10,"
+    "loudnorm=I=-20:TP=-1:LRA=11"
+)
 
-    _run([
-        "ffmpeg",
-        "-y",
-        "-i", str(video_path),
-        "-vn",
-        "-acodec", "pcm_s16le",
-        "-ar", "16000",
-        "-ac", "1",
-        str(output_path),
-    ])
+
+def extract_audio(video_path: Path, output_path: Path | None = None, *, clean: bool = False) -> Path:
+    """Extract audio from a video file as WAV (16kHz mono for Whisper).
+
+    With ``clean=True`` the speech cleanup chain (SPEECH_CLEAN_FILTER) is applied.
+    Timing is unchanged, so transcript timestamps still line up with the video.
+    """
+    if output_path is None:
+        fd, name = tempfile.mkstemp(suffix=".wav", prefix="vchunk_")
+        os.close(fd)
+        output_path = Path(name)
+
+    cmd = ["ffmpeg", "-y", "-i", str(video_path), "-vn"]
+    if clean:
+        cmd += ["-af", SPEECH_CLEAN_FILTER]
+    cmd += ["-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1", str(output_path)]
+    _run(cmd)
     return output_path
 
 
